@@ -1,0 +1,37 @@
+{
+  "name": "@fairy/bionic-memory",
+  "version": "0.1.0",
+  "description": "Fairy Bionic Memory - A bionic memory system for AI Agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "memory",
+    "rag",
+    "bionic-memory",
+    "llm"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}
