@@ -27,10 +27,13 @@ export interface MemoryRoute {
   file: string
   title: string
   content: string
+  action: 'append' | 'update' | 'delete'
 }
 
 export interface ConsolidationResult {
   memories: MemoryDocument[]
   created: number
+  updated: number
+  deleted: number
   skipped: number
 }

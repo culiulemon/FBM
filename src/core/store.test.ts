@@ -66,7 +66,7 @@ describe('MemoryStore', () => {
     expect(path1).not.toBe(path2)
   })
 
-  it('should get memory files with headings', async () => {
+  it('should get memory files with sections', async () => {
     await store.createFile('user-info', 'Basic Info', 'Name: cucu')
     await store.appendToFile('user-info', 'Tech Stack', 'TypeScript')
     await store.createFile('project-notes', 'Architecture', 'Some design')
@@ -76,22 +76,22 @@ describe('MemoryStore', () => {
 
     const userInfo = files.find(f => f.fileName.includes('user-info'))
     expect(userInfo).toBeDefined()
-    expect(userInfo!.headings).toContain('Basic Info')
-    expect(userInfo!.headings).toContain('Tech Stack')
+    expect(userInfo!.sections.some(s => s.heading === 'Basic Info')).toBe(true)
+    expect(userInfo!.sections.some(s => s.heading === 'Tech Stack')).toBe(true)
 
     const projectNotes = files.find(f => f.fileName.includes('project-notes'))
     expect(projectNotes).toBeDefined()
-    expect(projectNotes!.headings).toContain('Architecture')
+    expect(projectNotes!.sections.some(s => s.heading === 'Architecture')).toBe(true)
   })
 
-  it('should return empty headings for files without # headings', async () => {
+  it('should return empty sections for files without # headings', async () => {
     const { writeFile } = await import('node:fs/promises')
     await writeFile(join(testDir, 'plain.md'), 'Just some text without headings', 'utf-8')
 
     const files = await store.getMemoryFiles()
     const plain = files.find(f => f.fileName === 'plain.md')
     expect(plain).toBeDefined()
-    expect(plain!.headings).toHaveLength(0)
+    expect(plain!.sections).toHaveLength(0)
   })
 
   it('should write a memory document', async () => {

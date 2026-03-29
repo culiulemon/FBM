@@ -87,8 +87,8 @@ export class MemoryStore {
     }]
   }
 
-  async getMemoryFiles(): Promise<Array<{ fileName: string; headings: string[] }>> {
-    const results: Array<{ fileName: string; headings: string[] }> = []
+  async getMemoryFiles(): Promise<Array<{ fileName: string; sections: Array<{ heading: string; summary: string }> }>> {
+    const results: Array<{ fileName: string; sections: Array<{ heading: string; summary: string }> }> = []
     let files: string[]
     try {
       files = await readdir(this.memoryDir)
@@ -102,8 +102,8 @@ export class MemoryStore {
       try {
         const content = await readFile(filePath, 'utf-8')
         const nodes = parseMarkdown(content, filePath)
-        const headings = this.extractAllHeadings(nodes)
-        results.push({ fileName: file, headings })
+        const sections = this.extractSections(nodes, content)
+        results.push({ fileName: file, sections })
       } catch {
         continue
       }
@@ -112,21 +112,32 @@ export class MemoryStore {
     return results
   }
 
-  private extractAllHeadings(nodes: import('../types/memory.js').HeadingNode[]): string[] {
-    const result: string[] = []
+  private extractSections(nodes: import('../types/memory.js').HeadingNode[], rawContent: string): Array<{ heading: string; summary: string }> {
+    const result: Array<{ heading: string; summary: string }> = []
     for (const node of nodes) {
       if (node.type === 'heading') {
-        result.push(node.title)
+        const sectionContent = this.extractNodeText(node, rawContent)
+        const summary = sectionContent.length > 300
+          ? sectionContent.slice(0, 300) + '...'
+          : sectionContent
+        result.push({ heading: node.title, summary })
         if (node.children) {
           for (const child of node.children) {
             if (child.type === 'heading') {
-              result.push(...this.extractAllHeadings([child]))
+              result.push(...this.extractSections([child], rawContent))
             }
           }
         }
       }
     }
     return result
+  }
+
+  private extractNodeText(node: import('../types/memory.js').HeadingNode, rawContent: string): string {
+    if (!node.lineEnd || !node.lineStart) return ''
+    const lines = rawContent.split('\n')
+    const sectionLines = lines.slice(node.lineStart, node.lineEnd + 1)
+    return sectionLines.join('\n').trim()
   }
 
   async appendToFile(fileName: string, title: string, content: string): Promise<string> {
@@ -143,6 +154,76 @@ export class MemoryStore {
       : `# ${title}\n\n${content}`
     await writeFile(filePath, newContent, 'utf-8')
     return filePath
+  }
+
+  async updateSection(fileName: string, heading: string, newContent: string): Promise<string> {
+    const safeName = sanitizeFileName(fileName)
+    const filePath = join(this.memoryDir, `${safeName}.md`)
+    const existing = await readFile(filePath, 'utf-8')
+    const lines = existing.split('\n')
+    const newLines: string[] = []
+    let replaced = false
+    let i = 0
+    while (i < lines.length) {
+      const line = lines[i]
+      const trimmed = line.trim()
+      if (!replaced && trimmed.startsWith('#') && (trimmed === `# ${heading}` || trimmed === `## ${heading}`)) {
+        newLines.push(line)
+        newLines.push('')
+        newLines.push(newContent)
+        replaced = true
+        i++
+        while (i < lines.length && !this.isHeadingLine(lines[i])) {
+          i++
+        }
+      } else {
+        newLines.push(line)
+        i++
+      }
+    }
+    if (!replaced) {
+      return this.appendToFile(fileName, heading, newContent)
+    }
+    const updated = newLines.join('\n')
+    await writeFile(filePath, updated, 'utf-8')
+    return filePath
+  }
+
+  async deleteSection(fileName: string, heading: string): Promise<string> {
+    const safeName = sanitizeFileName(fileName)
+    const filePath = join(this.memoryDir, `${safeName}.md`)
+    const existing = await readFile(filePath, 'utf-8')
+    const lines = existing.split('\n')
+    const newLines: string[] = []
+    let i = 0
+    let deleted = false
+    while (i < lines.length) {
+      const line = lines[i]
+      const trimmed = line.trim()
+      if (!deleted && trimmed.startsWith('#') && (trimmed === `# ${heading}` || trimmed === `## ${heading}`)) {
+        deleted = true
+        i++
+        while (i < lines.length && !this.isHeadingLine(lines[i])) {
+          i++
+        }
+      } else {
+        newLines.push(line)
+        i++
+      }
+    }
+    if (!deleted) return filePath
+    const updated = newLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+    if (!updated) {
+      await unlink(filePath)
+      return filePath
+    }
+    await writeFile(filePath, updated, 'utf-8')
+    return filePath
+  }
+
+  private isHeadingLine(line: string): boolean {
+    const trimmed = line.trim()
+    return trimmed.startsWith('# ') || trimmed.startsWith('## ') || trimmed.startsWith('### ')
   }
 
   async createFile(fileName: string, title: string, content: string): Promise<string> {

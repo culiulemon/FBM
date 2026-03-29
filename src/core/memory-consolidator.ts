@@ -6,22 +6,27 @@ import { MemoryStore } from './store.js'
 
 const CONSOLIDATION_PROMPT = `You are a memory consolidation assistant. Analyze the conversation and extract information worth remembering long-term.
 
-You will receive a list of existing memory files with their section headings. For each piece of valuable information, decide whether to add it to an existing file or create a new file.
+You will receive a list of existing memory files with their section headings and content summaries. For each piece of valuable information, decide which action to take:
+
+Actions:
+- "append": Add a NEW section to an existing file, or create a new file if the file doesn't exist yet. ONLY use this for topics that do NOT already have a matching section in any existing file.
+- "update": Replace the content of an existing section with updated information. MUST use this when a section with a SIMILAR topic already exists — even if the information is partially new. Merge new information into the existing section rather than creating a duplicate.
+- "delete": Remove an existing section that is no longer relevant or accurate.
 
 Output a JSON array of objects with:
-- "file": the target file name (without .md extension). Use an existing file name if the information belongs there, or create a descriptive new file name (2-6 words, meaningful for future retrieval).
-- "title": a concise section title (2-8 words) for the new section within the file
-- "content": the extracted information as structured markdown
+- "file": the target file name (without .md extension). MUST use an existing file name if the information is related to any existing section in that file.
+- "title": the section heading title. For "update"/"delete", must match the EXACT existing heading title. For "append", use a clear, distinct title that does NOT overlap with any existing section.
+- "content": the extracted information as structured markdown (ignored for delete action). For "update", include ALL relevant information (old + new merged).
+- "action": one of "append", "update", "delete"
 
-Rules:
-- Extract factual knowledge, lessons learned, user preferences, important decisions
-- Skip trivial small talk, greetings, acknowledgments
-- If multiple pieces are unrelated, output multiple objects
-- Group related information into the same file
-- Title should be descriptive and searchable
-- Content should be self-contained and understandable without the original conversation
-- File names should be concise and descriptive (e.g. "用户信息", "项目开发记录")
-- Output ONLY a JSON array, nothing else`
+CRITICAL RULES (must follow strictly):
+- NEVER create a new section if a similar topic already exists in the same file — use "update" instead with the EXACT existing heading.
+- NEVER output two sections with similar topics in the same consolidation batch — merge them into one "update".
+- Extract factual knowledge, lessons learned, user preferences, important decisions.
+- Skip trivial small talk, greetings, acknowledgments, and information that is already accurately captured in existing sections.
+- Content should be self-contained and understandable without the original conversation.
+- File names should be concise and descriptive (e.g. "用户信息", "项目开发记录").
+- Output ONLY a JSON array, nothing else.`
 
 export class MemoryConsolidator {
   private store: MemoryStore
@@ -41,10 +46,10 @@ export class MemoryConsolidator {
 
   async consolidate(messages: ConversationMessage[]): Promise<ConsolidationResult> {
     if (messages.length === 0) {
-      return { memories: [], created: 0, skipped: 0 }
+      return { memories: [], created: 0, updated: 0, deleted: 0, skipped: 0 }
     }
 
-    let existingFiles: Array<{ fileName: string; headings: string[] }>
+    let existingFiles: Array<{ fileName: string; sections: Array<{ heading: string; summary: string }> }>
     try {
       existingFiles = await this.store.getMemoryFiles()
     } catch {
@@ -52,7 +57,9 @@ export class MemoryConsolidator {
     }
 
     const fileListSection = existingFiles.length > 0
-      ? `\n\nExisting memory files:\n${existingFiles.map(f => `- ${f.fileName.replace(/\.md$/, '')}: [${f.headings.join(', ')}]`).join('\n')}`
+      ? `\n\nExisting memory files and sections:\n${existingFiles.map(f =>
+          `- ${f.fileName.replace(/\.md$/, '')}:\n${f.sections.map(s => `    - ${s.heading}: ${s.summary}`).join('\n')}`
+        ).join('\n')}`
       : '\n\nNo existing memory files.'
 
     const conversationText = messages
@@ -72,26 +79,55 @@ export class MemoryConsolidator {
       })
       const jsonMatch = response.content.trim().match(/\[[\s\S]*\]/)
       if (!jsonMatch) {
-        return { memories: [], created: 0, skipped: 0 }
+        return { memories: [], created: 0, updated: 0, deleted: 0, skipped: 0 }
       }
       rawMemories = JSON.parse(jsonMatch[0])
     } catch {
-      return { memories: [], created: 0, skipped: 0 }
+      return { memories: [], created: 0, updated: 0, deleted: 0, skipped: 0 }
     }
 
-    const result: ConsolidationResult = { memories: [], created: 0, skipped: 0 }
+    const result: ConsolidationResult = { memories: [], created: 0, updated: 0, deleted: 0, skipped: 0 }
 
     for (const raw of rawMemories) {
       try {
+        const action = raw.action || 'append'
         const existingFile = existingFiles.find(
           f => f.fileName.replace(/\.md$/, '') === raw.file
         )
 
         let filePath: string
-        if (existingFile) {
-          filePath = await this.store.appendToFile(raw.file, raw.title, raw.content)
+        if (action === 'delete') {
+          if (existingFile) {
+            filePath = await this.store.deleteSection(raw.file, raw.title)
+            result.deleted++
+          } else {
+            result.skipped++
+            continue
+          }
+        } else if (action === 'update') {
+          if (existingFile) {
+            filePath = await this.store.updateSection(raw.file, raw.title, raw.content)
+          } else {
+            filePath = await this.store.createFile(raw.file, raw.title, raw.content)
+            result.created++
+          }
+          result.updated++
         } else {
-          filePath = await this.store.createFile(raw.file, raw.title, raw.content)
+          if (existingFile) {
+            const hasExactSection = existingFile.sections.some(
+              s => s.heading === raw.title
+            )
+            if (hasExactSection) {
+              filePath = await this.store.updateSection(raw.file, raw.title, raw.content)
+              result.updated++
+            } else {
+              filePath = await this.store.appendToFile(raw.file, raw.title, raw.content)
+              result.created++
+            }
+          } else {
+            filePath = await this.store.createFile(raw.file, raw.title, raw.content)
+            result.created++
+          }
         }
 
         const doc: MemoryDocument = {
@@ -104,7 +140,6 @@ export class MemoryConsolidator {
         }
 
         result.memories.push(doc)
-        result.created++
       } catch {
         result.skipped++
       }
