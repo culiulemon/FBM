@@ -1,7 +1,10 @@
+vi.mock('./fs-adapter.js', async () => {
+  return await import('./__mocks__/fs-adapter.js')
+})
+
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { MemoryStore } from './store.js'
-import { MemoryType } from '../types/memory.js'
-import { mkdir, rm, readFile } from 'node:fs/promises'
+import { rm, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -19,97 +22,98 @@ describe('MemoryStore', () => {
     await rm(testDir, { recursive: true, force: true })
   })
 
-  it('should create default type directories on init', async () => {
+  it('should create only the root memories directory on init', async () => {
     const { readdir } = await import('node:fs/promises')
-    const dirs = await readdir(testDir)
-    expect(dirs).toContain('knowledge')
-    expect(dirs).toContain('experience')
-    expect(dirs).toContain('preference')
-    expect(dirs).toContain('event')
-    expect(dirs).toContain('project')
+    const entries = await readdir(testDir)
+    expect(entries).toHaveLength(0)
   })
 
-  it('should write a memory document to correct type directory', async () => {
+  it('should create a new file with createFile', async () => {
+    const filePath = await store.createFile('test-doc', 'Test Title', 'Some content here.')
+    const content = await readFile(filePath, 'utf-8')
+    expect(content).toContain('# Test Title')
+    expect(content).toContain('Some content here')
+    expect(filePath.endsWith('test-doc.md')).toBe(true)
+  })
+
+  it('should sanitize file names', async () => {
+    const filePath = await store.createFile('Tauri<2.0>: Desktop/App "Guide"', 'Title', 'test')
+    const fileName = filePath.split(/[\\/]/).pop()!
+    expect(fileName).not.toMatch(/[<>:"|?*]/)
+    expect(filePath.endsWith('.md')).toBe(true)
+  })
+
+  it('should append a section to existing file', async () => {
+    await store.createFile('user-info', 'Basic Info', 'Name: cucu')
+    const filePath = await store.appendToFile('user-info', 'Tech Stack', 'TypeScript, React')
+
+    const content = await readFile(filePath, 'utf-8')
+    expect(content).toContain('# Basic Info')
+    expect(content).toContain('## Tech Stack')
+    expect(content).toContain('TypeScript, React')
+  })
+
+  it('should create file if not exists when appending', async () => {
+    const filePath = await store.appendToFile('new-file', 'New Section', 'New content')
+    const content = await readFile(filePath, 'utf-8')
+    expect(content).toContain('# New Section')
+    expect(content).toContain('New content')
+  })
+
+  it('should handle duplicate file names by adding timestamp', async () => {
+    const path1 = await store.createFile('test-doc', 'Title', 'first')
+    const path2 = await store.createFile('test-doc', 'Title', 'second')
+    expect(path1).not.toBe(path2)
+  })
+
+  it('should get memory files with headings', async () => {
+    await store.createFile('user-info', 'Basic Info', 'Name: cucu')
+    await store.appendToFile('user-info', 'Tech Stack', 'TypeScript')
+    await store.createFile('project-notes', 'Architecture', 'Some design')
+
+    const files = await store.getMemoryFiles()
+    expect(files).toHaveLength(2)
+
+    const userInfo = files.find(f => f.fileName.includes('user-info'))
+    expect(userInfo).toBeDefined()
+    expect(userInfo!.headings).toContain('Basic Info')
+    expect(userInfo!.headings).toContain('Tech Stack')
+
+    const projectNotes = files.find(f => f.fileName.includes('project-notes'))
+    expect(projectNotes).toBeDefined()
+    expect(projectNotes!.headings).toContain('Architecture')
+  })
+
+  it('should return empty headings for files without # headings', async () => {
+    const { writeFile } = await import('node:fs/promises')
+    await writeFile(join(testDir, 'plain.md'), 'Just some text without headings', 'utf-8')
+
+    const files = await store.getMemoryFiles()
+    const plain = files.find(f => f.fileName === 'plain.md')
+    expect(plain).toBeDefined()
+    expect(plain!.headings).toHaveLength(0)
+  })
+
+  it('should write a memory document', async () => {
     const filePath = await store.write({
-      type: MemoryType.Knowledge,
       title: 'Rust Async Programming',
       content: '# Rust Async Programming\n\nSome content here.',
       createdAt: Date.now(),
       updatedAt: Date.now(),
     })
 
-    expect(filePath).toContain('knowledge')
-    expect(filePath).toContain('Rust Async Programming.md')
-
     const content = await readFile(filePath, 'utf-8')
     expect(content).toContain('Some content here')
   })
 
-  it('should sanitize file names', async () => {
-    const filePath = await store.write({
-      type: MemoryType.Knowledge,
-      title: 'Tauri<2.0>: Desktop/App "Guide"',
-      content: 'test',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    })
-
-    const fileName = filePath.split(/[\\/]/).pop()!
-    expect(fileName).not.toMatch(/[<>:"|?*]/)
-    expect(filePath.endsWith('.md')).toBe(true)
-  })
-
-  it('should handle duplicate file names by adding timestamp', async () => {
-    const doc = {
-      type: MemoryType.Knowledge,
-      title: 'Test Document',
-      content: 'first',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    }
-
-    const path1 = await store.write({ ...doc })
-    const path2 = await store.write({ ...doc, content: 'second' })
-
-    expect(path1).not.toBe(path2)
-  })
-
-  it('should read memories by type', async () => {
-    await store.write({
-      type: MemoryType.Knowledge,
-      title: 'Knowledge Doc',
-      content: 'knowledge content',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    })
-    await store.write({
-      type: MemoryType.Preference,
-      title: 'Preference Doc',
-      content: 'preference content',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    })
-
-    const knowledgeDocs = await store.read({ type: MemoryType.Knowledge })
-    expect(knowledgeDocs).toHaveLength(1)
-    expect(knowledgeDocs[0].type).toBe(MemoryType.Knowledge)
-    expect(knowledgeDocs[0].content).toContain('knowledge content')
-
-    const preferenceDocs = await store.read({ type: MemoryType.Preference })
-    expect(preferenceDocs).toHaveLength(1)
-    expect(preferenceDocs[0].type).toBe(MemoryType.Preference)
-  })
-
   it('should read memories by keyword', async () => {
     await store.write({
-      type: MemoryType.Knowledge,
       title: 'Rust Guide',
       content: 'Rust is a systems programming language',
       createdAt: Date.now(),
       updatedAt: Date.now(),
     })
     await store.write({
-      type: MemoryType.Knowledge,
       title: 'TypeScript Guide',
       content: 'TypeScript is a typed superset of JavaScript',
       createdAt: Date.now(),
@@ -123,7 +127,6 @@ describe('MemoryStore', () => {
 
   it('should update existing files', async () => {
     const filePath = await store.write({
-      type: MemoryType.Knowledge,
       title: 'Updatable Doc',
       content: 'original content',
       createdAt: Date.now(),
@@ -137,7 +140,6 @@ describe('MemoryStore', () => {
 
   it('should delete files', async () => {
     const filePath = await store.write({
-      type: MemoryType.Knowledge,
       title: 'Deletable Doc',
       content: 'to be deleted',
       createdAt: Date.now(),
@@ -145,18 +147,12 @@ describe('MemoryStore', () => {
     })
 
     await store.delete(filePath)
-    const results = await store.read({ type: MemoryType.Knowledge })
-    expect(results).toHaveLength(0)
-  })
-
-  it('should return empty results for non-existent type directory', async () => {
-    const results = await store.read({ type: MemoryType.Custom })
+    const results = await store.read()
     expect(results).toHaveLength(0)
   })
 
   it('should handle empty title', async () => {
     const filePath = await store.write({
-      type: MemoryType.Knowledge,
       title: '',
       content: 'empty title doc',
       createdAt: Date.now(),

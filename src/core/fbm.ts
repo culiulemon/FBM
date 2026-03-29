@@ -1,8 +1,7 @@
 import type { FBMConfig } from '../types/config.js'
 import type { LLMAdapter, EmbeddingAdapter } from '../types/adapter.js'
-import type { MemorySummary } from '../types/retrieval.js'
+import type { RetrievalResult, ConsolidationResult, MemorySummary } from '../types/retrieval.js'
 import type { ConversationMessage } from '../types/conversation.js'
-import type { ConsolidationResult } from '../types/retrieval.js'
 import type { HeadingNode } from '../types/memory.js'
 import { MemoryStore } from './store.js'
 import { IndexEngine } from './index-engine.js'
@@ -11,8 +10,7 @@ import { NodeLocator, parseMarkdown } from './node-locator.js'
 import { MemoryRetriever } from './memory-retriever.js'
 import { VectorIndex } from './vector-index.js'
 import { MemoryConsolidator } from './memory-consolidator.js'
-import { DynamicMemory, type MemoryInjection } from './dynamic-memory.js'
-import { readFile } from 'node:fs/promises'
+import { readFile } from './fs-adapter.js'
 
 export class FBM {
   private config: FBMConfig
@@ -23,7 +21,6 @@ export class FBM {
   private vectorIndex!: VectorIndex
   private retriever!: MemoryRetriever
   private consolidator!: MemoryConsolidator
-  private dynamicMemory!: DynamicMemory
   private llm: LLMAdapter
   private embedding: EmbeddingAdapter | null
   private unwatch: (() => void) | null = null
@@ -62,8 +59,8 @@ export class FBM {
       nodeLocator: this.nodeLocator,
       vectorIndex: this.vectorIndex,
       llm: this.llm,
-      topK: this.config.dynamicMemory.retrievalTopK,
-      maxTokens: this.config.dynamicMemory.maxContextTokens,
+      topK: this.config.retrieval?.retrievalTopK,
+      refineResults: this.config.retrieval?.refineResults,
     })
 
     this.consolidator = new MemoryConsolidator(
@@ -71,13 +68,6 @@ export class FBM {
       this.llm,
       this.config.consolidator
     )
-
-    this.dynamicMemory = new DynamicMemory({
-      retriever: this.retriever,
-      store: this.store,
-      llm: this.llm,
-      config: this.config.dynamicMemory,
-    })
 
     await this.store.init()
     await this.indexEngine.build()
@@ -94,6 +84,9 @@ export class FBM {
           await this.vectorIndex.removeByFile(filePath)
         } else if (event === 'change' || event === 'add') {
           await this.indexEngine.updateFile(filePath)
+          if (this.vectorIndex.enabled) {
+            await this.addVectorsForFile(filePath)
+          }
         }
       })
     }
@@ -117,15 +110,17 @@ export class FBM {
     return this.retriever.retrieveAndSummarize(query)
   }
 
-  async onUserMessage(message: ConversationMessage): Promise<MemoryInjection[]> {
+  async consolidate(messages: ConversationMessage[]): Promise<ConsolidationResult> {
     this.ensureInitialized()
-    this.consolidator.feedMessage(message)
-    return this.dynamicMemory.onUserMessage(message)
+    return this.consolidator.consolidate(messages)
   }
 
-  async onAssistantMessage(message: ConversationMessage): Promise<void> {
+  async writeMemory(title: string, content: string, targetFile?: string): Promise<string> {
     this.ensureInitialized()
-    await this.dynamicMemory.onAssistantMessage(message)
+    if (targetFile) {
+      return this.store.appendToFile(targetFile, title, content)
+    }
+    return this.store.createFile(title, title, content)
   }
 
   getStore(): MemoryStore {
@@ -146,11 +141,6 @@ export class FBM {
   getConsolidator(): MemoryConsolidator {
     this.ensureInitialized()
     return this.consolidator
-  }
-
-  getDynamicMemory(): DynamicMemory {
-    this.ensureInitialized()
-    return this.dynamicMemory
   }
 
   async reindexVectors(): Promise<number> {
@@ -177,7 +167,6 @@ export class FBM {
   async shutdown(): Promise<void> {
     this.consolidator.destroy()
     this.unwatch?.()
-    this.dynamicMemory.reset()
     this._initialized = false
   }
 
@@ -213,7 +202,7 @@ export class FBM {
           lineEnd: h.lineEnd,
           title: h.title,
         },
-        content: this.nodeLocator.extractContent(h).slice(0, 1000),
+        content: `${h.title}\n${this.nodeLocator.extractContent(h).slice(0, 1000)}`,
       }))
 
       if (items.length > 0) {

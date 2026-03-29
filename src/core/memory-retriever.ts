@@ -5,14 +5,9 @@ import { IndexEngine } from './index-engine.js'
 import { KeywordExtractor } from './keyword-extractor.js'
 import { NodeLocator, parseMarkdown } from './node-locator.js'
 import { VectorIndex } from './vector-index.js'
-import { readFile } from 'node:fs/promises'
+import { readFile } from './fs-adapter.js'
 
-const SUMMARIZE_PROMPT = `You are a memory summarization assistant. Given the user's query and retrieved document fragments, summarize the relevant information concisely.
-Rules:
-- Only include information directly relevant to the query
-- Be concise but comprehensive
-- If fragments are from different topics, organize them logically
-- Output in the same language as the query`
+const SUMMARIZE_PROMPT = `You are a memory refinement assistant. Given the user's query and retrieved document fragments, filter and refine only the information directly relevant to the query. Output in the same language as the query.`
 
 export class MemoryRetriever {
   private indexEngine: IndexEngine
@@ -21,7 +16,7 @@ export class MemoryRetriever {
   private vectorIndex: VectorIndex
   private llm: LLMAdapter | null
   private topK: number
-  private maxTokens: number
+  private refineResults: boolean
 
   constructor(deps: {
     indexEngine: IndexEngine
@@ -30,7 +25,7 @@ export class MemoryRetriever {
     vectorIndex?: VectorIndex
     llm?: LLMAdapter
     topK?: number
-    maxTokens?: number
+    refineResults?: boolean
   }) {
     this.indexEngine = deps.indexEngine
     this.keywordExtractor = deps.keywordExtractor
@@ -38,12 +33,23 @@ export class MemoryRetriever {
     this.vectorIndex = deps.vectorIndex ?? new VectorIndex()
     this.llm = deps.llm ?? null
     this.topK = deps.topK ?? 10
-    this.maxTokens = deps.maxTokens ?? 2000
+    this.refineResults = deps.refineResults ?? true
   }
 
   async retrieve(query: string): Promise<RetrievalResult[]> {
-    const keywords = await this.keywordExtractor.extract(query)
-    const expandedKeywords = await this.keywordExtractor.expand(keywords)
+    let keywords: string[]
+    try {
+      keywords = await this.keywordExtractor.extract(query)
+    } catch {
+      return []
+    }
+
+    let expandedKeywords: string[]
+    try {
+      expandedKeywords = await this.keywordExtractor.expand(keywords)
+    } catch {
+      return []
+    }
 
     const keywordResults = this.indexEngine.search(expandedKeywords)
 
@@ -63,12 +69,13 @@ export class MemoryRetriever {
   }
 
   async summarize(query: string, results: RetrievalResult[]): Promise<MemorySummary> {
-    if (!this.llm || results.length === 0) {
+    if (!this.refineResults || !this.llm || results.length === 0) {
+      const joined = results.map(r => r.content).join('\n\n---\n\n')
       return {
         query,
         results,
-        summary: results.map(r => r.content).join('\n\n---\n\n'),
-        tokenCount: this.estimateTokens(results.map(r => r.content).join('')),
+        summary: joined,
+        tokenCount: this.estimateTokens(joined),
       }
     }
 
@@ -82,7 +89,7 @@ export class MemoryRetriever {
       { role: 'user', content: `Query: ${query}\n\nRetrieved fragments:\n${fragments}` },
     ]
 
-    const response = await this.llm.chat(messages, { maxTokens: this.maxTokens })
+    const response = await this.llm.chat(messages)
     return {
       query,
       results,
@@ -96,6 +103,17 @@ export class MemoryRetriever {
     if (results.length === 0) {
       return { query, results: [], summary: '', tokenCount: 0 }
     }
+
+    if (!this.refineResults) {
+      const joined = results.map(r => r.content).join('\n\n---\n\n')
+      return {
+        query,
+        results,
+        summary: joined,
+        tokenCount: this.estimateTokens(joined),
+      }
+    }
+
     return this.summarize(query, results)
   }
 

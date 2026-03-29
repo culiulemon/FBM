@@ -8,8 +8,8 @@ import type {
   SerializedIndex,
 } from '../types/index.js'
 import { NodeLocator, parseMarkdown } from './node-locator.js'
-import { readFile, writeFile, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readFile, writeFile, stat } from './fs-adapter.js'
+import { join } from './fs-adapter.js'
 
 const STOP_WORDS = new Set([
   'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',

@@ -1,15 +1,14 @@
 export interface FBMConfig {
   memoryDir: string
-  store: StoreConfig
+  store?: StoreConfig
   embedding?: EmbeddingConfig
-  consolidator: ConsolidatorConfig
-  dynamicMemory: DynamicMemoryConfig
+  retrieval?: RetrievalConfig
+  consolidator?: ConsolidatorConfig
 }
 
 export interface StoreConfig {
   indexCacheFile?: string
   watchFiles?: boolean
-  defaultMemoryTypes?: string[]
 }
 
 export interface EmbeddingConfig {
@@ -17,17 +16,13 @@ export interface EmbeddingConfig {
   vectorCacheFile?: string
 }
 
-export interface ConsolidatorConfig {
-  enabled: boolean
-  idleTimeoutMs: number
-  minConversationTurns: number
-  maxSummaryTokens: number
+export interface RetrievalConfig {
+  refineResults?: boolean
+  retrievalTopK?: number
+  minScore?: number
+  maxContextTokens?: number
 }
 
-export interface DynamicMemoryConfig {
-  enabled: boolean
-  maxContextTokens: number
-  retrievalTopK: number
-  minScore: number
-  injectAsSystem: boolean
+export interface ConsolidatorConfig {
+  maxSummaryTokens?: number
 }

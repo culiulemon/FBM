@@ -1,6 +1,6 @@
 import type { EmbeddingAdapter } from '../types/adapter.js'
 import type { VectorEntry, EmbeddingRef, SimilarityResult, VectorStore, SerializedVectorStore } from '../types/vector.js'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, writeFile } from './fs-adapter.js'
 
 function entryId(ref: EmbeddingRef): string {
   return `${ref.filePath}:${ref.headingPath.join('/')}:${ref.lineStart}-${ref.lineEnd}`

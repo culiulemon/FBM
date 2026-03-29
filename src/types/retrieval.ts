@@ -1,4 +1,3 @@
-import type { MemoryType } from './memory.js'
 import type { NodeRef } from './index.js'
 
 export interface RetrievalResult {
@@ -16,17 +15,22 @@ export interface MemorySummary {
 }
 
 export interface MemoryDocument {
-  type: MemoryType
   title: string
   content: string
   filePath?: string
+  fileName?: string
   createdAt: number
   updatedAt: number
 }
 
+export interface MemoryRoute {
+  file: string
+  title: string
+  content: string
+}
+
 export interface ConsolidationResult {
   memories: MemoryDocument[]
-  merged: number
   created: number
   skipped: number
 }

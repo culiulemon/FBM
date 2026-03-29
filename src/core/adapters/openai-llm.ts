@@ -16,7 +16,9 @@ export class OpenAILLMAdapter implements LLMAdapter {
   }
 
   async chat(messages: LLMMessage[], options?: LLMOptions): Promise<LLMResponse> {
-    const url = `${this.baseUrl}/v1/chat/completions`
+    const url = this.baseUrl.endsWith('/chat/completions')
+      ? this.baseUrl
+      : `${this.baseUrl}/chat/completions`
     const body = {
       model: this.model,
       messages: messages.map(m => ({ role: m.role, content: m.content })),

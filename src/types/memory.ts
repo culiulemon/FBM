@@ -1,29 +1,3 @@
-export enum MemoryType {
-  Knowledge = 'knowledge',
-  Experience = 'experience',
-  Preference = 'preference',
-  Event = 'event',
-  Project = 'project',
-  Custom = 'custom',
-}
-
-export const MEMORY_TYPE_DIRS: Record<MemoryType, string> = {
-  [MemoryType.Knowledge]: 'knowledge',
-  [MemoryType.Experience]: 'experience',
-  [MemoryType.Preference]: 'preference',
-  [MemoryType.Event]: 'event',
-  [MemoryType.Project]: 'project',
-  [MemoryType.Custom]: 'custom',
-}
-
-export const DEFAULT_MEMORY_TYPES: MemoryType[] = [
-  MemoryType.Knowledge,
-  MemoryType.Experience,
-  MemoryType.Preference,
-  MemoryType.Event,
-  MemoryType.Project,
-]
-
 export type MemoryNodeType = 'heading' | 'paragraph' | 'code' | 'list'
 
 export interface BaseNode {

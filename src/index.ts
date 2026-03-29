@@ -1,4 +1,3 @@
-export { MemoryType } from './types/memory.js'
 export type {
   MemoryNode,
   HeadingNode,
@@ -26,6 +25,7 @@ export type {
   RetrievalResult,
   MemorySummary,
   MemoryDocument,
+  MemoryRoute,
   ConsolidationResult,
 } from './types/retrieval.js'
 
@@ -33,8 +33,8 @@ export type {
   FBMConfig,
   StoreConfig,
   EmbeddingConfig,
+  RetrievalConfig,
   ConsolidatorConfig,
-  DynamicMemoryConfig,
 } from './types/config.js'
 
 export type {
@@ -54,6 +54,5 @@ export { KeywordExtractor } from './core/keyword-extractor.js'
 export { MemoryRetriever } from './core/memory-retriever.js'
 export { VectorIndex } from './core/vector-index.js'
 export { MemoryConsolidator } from './core/memory-consolidator.js'
-export { DynamicMemory } from './core/dynamic-memory.js'
 export { OpenAILLMAdapter } from './core/adapters/openai-llm.js'
 export { OpenAIEmbeddingAdapter } from './core/adapters/openai-embedding.js'

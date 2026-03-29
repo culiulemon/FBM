@@ -1,10 +1,8 @@
-import { MemoryType, MEMORY_TYPE_DIRS, DEFAULT_MEMORY_TYPES } from '../types/memory.js'
 import type { MemoryDocument } from '../types/retrieval.js'
 import type { StoreConfig } from '../types/config.js'
-import { mkdir, writeFile, readFile, unlink, readdir, stat, access } from 'node:fs/promises'
-import { watch } from 'node:fs'
-import { join, basename, extname } from 'node:path'
-import type { FSWatcher } from 'node:fs'
+import { mkdir, writeFile, readFile, unlink, readdir, stat, access, join, basename, extname, watch } from './fs-adapter.js'
+import type { FSWatcher } from './fs-adapter.js'
+import { parseMarkdown } from './node-locator.js'
 
 const INVALID_CHARS = /[<>:"/\\|?*\x00-\x1f]/g
 const MAX_FILENAME_LEN = 200
@@ -13,19 +11,7 @@ function sanitizeFileName(title: string): string {
   let safe = title.replace(INVALID_CHARS, '_').trim().replace(/\.+$/, '')
   if (safe.length === 0) safe = 'untitled'
   if (safe.length > MAX_FILENAME_LEN) safe = safe.slice(0, MAX_FILENAME_LEN)
-  if (!extname(safe).toLowerCase().endsWith('.md')) safe += '.md'
   return safe
-}
-
-function getTypeDir(memoryDir: string, type: MemoryType): string {
-  return join(memoryDir, MEMORY_TYPE_DIRS[type])
-}
-
-function getTypeFromDirName(dirName: string): MemoryType {
-  for (const [type, dir] of Object.entries(MEMORY_TYPE_DIRS)) {
-    if (dir === dirName) return type as MemoryType
-  }
-  return MemoryType.Custom
 }
 
 export class MemoryStore {
@@ -39,34 +25,13 @@ export class MemoryStore {
 
   async init(): Promise<void> {
     await mkdir(this.memoryDir, { recursive: true })
-    const types = this.storeConfig.defaultMemoryTypes
-      ? this.storeConfig.defaultMemoryTypes.map(t => t as MemoryType)
-      : DEFAULT_MEMORY_TYPES
-    for (const type of types) {
-      await mkdir(getTypeDir(this.memoryDir, type), { recursive: true })
-    }
   }
 
   async write(doc: MemoryDocument): Promise<string> {
-    const typeDir = getTypeDir(this.memoryDir, doc.type)
-    await mkdir(typeDir, { recursive: true })
-    let fileName = sanitizeFileName(doc.title)
-    const filePath = join(typeDir, fileName)
-    try {
-      await access(filePath)
-      const timestamp = Date.now()
-      const nameWithoutExt = basename(fileName, '.md')
-      fileName = sanitizeFileName(`${nameWithoutExt}_${timestamp}`)
-    } catch {
-      // file does not exist, use original name
-    }
-    const finalPath = join(typeDir, fileName)
-    await writeFile(finalPath, doc.content, 'utf-8')
-    return finalPath
+    return this.createFile(doc.fileName ?? doc.title, doc.title, doc.content)
   }
 
   async read(options: {
-    type?: MemoryType
     keyword?: string
     since?: number
     path?: string
@@ -75,48 +40,34 @@ export class MemoryStore {
       return this.readSingleFile(options.path)
     }
 
-    const dirs: string[] = []
-    if (options.type) {
-      dirs.push(getTypeDir(this.memoryDir, options.type))
-    } else {
-      const types = this.storeConfig.defaultMemoryTypes
-        ? this.storeConfig.defaultMemoryTypes.map(t => t as MemoryType)
-        : DEFAULT_MEMORY_TYPES
-      for (const type of types) {
-        dirs.push(getTypeDir(this.memoryDir, type))
-      }
+    const results: MemoryDocument[] = []
+    let files: string[]
+    try {
+      files = await readdir(this.memoryDir)
+    } catch {
+      return results
     }
 
-    const results: MemoryDocument[] = []
-    for (const dir of dirs) {
-      let files: string[]
+    for (const file of files) {
+      if (!file.endsWith('.md')) continue
+      const filePath = join(this.memoryDir, file)
       try {
-        files = await readdir(dir)
+        const content = await readFile(filePath, 'utf-8')
+        const fileStat = await stat(filePath)
+
+        if (options.since !== undefined && fileStat.mtimeMs < options.since) continue
+        if (options.keyword && !content.toLowerCase().includes(options.keyword.toLowerCase())) continue
+
+        results.push({
+          title: file.replace(/\.md$/, ''),
+          content,
+          filePath,
+          fileName: file,
+          createdAt: fileStat.birthtimeMs,
+          updatedAt: fileStat.mtimeMs,
+        })
       } catch {
         continue
-      }
-      for (const file of files) {
-        if (!file.endsWith('.md')) continue
-        const filePath = join(dir, file)
-        try {
-          const content = await readFile(filePath, 'utf-8')
-          const fileStat = await stat(filePath)
-
-          if (options.since !== undefined && fileStat.mtimeMs < options.since) continue
-          if (options.keyword && !content.toLowerCase().includes(options.keyword.toLowerCase())) continue
-
-          const dirName = basename(dir)
-          results.push({
-            type: getTypeFromDirName(dirName),
-            title: file.replace(/\.md$/, ''),
-            content,
-            filePath,
-            createdAt: fileStat.birthtimeMs,
-            updatedAt: fileStat.mtimeMs,
-          })
-        } catch {
-          continue
-        }
       }
     }
 
@@ -126,15 +77,87 @@ export class MemoryStore {
   private async readSingleFile(filePath: string): Promise<MemoryDocument[]> {
     const content = await readFile(filePath, 'utf-8')
     const fileStat = await stat(filePath)
-    const type = getTypeFromDirName(basename(join(filePath, '..')))
     return [{
-      type,
       title: basename(filePath).replace(/\.md$/, ''),
       content,
       filePath,
+      fileName: basename(filePath),
       createdAt: fileStat.birthtimeMs,
       updatedAt: fileStat.mtimeMs,
     }]
+  }
+
+  async getMemoryFiles(): Promise<Array<{ fileName: string; headings: string[] }>> {
+    const results: Array<{ fileName: string; headings: string[] }> = []
+    let files: string[]
+    try {
+      files = await readdir(this.memoryDir)
+    } catch {
+      return results
+    }
+
+    for (const file of files) {
+      if (!file.endsWith('.md')) continue
+      const filePath = join(this.memoryDir, file)
+      try {
+        const content = await readFile(filePath, 'utf-8')
+        const nodes = parseMarkdown(content, filePath)
+        const headings = this.extractAllHeadings(nodes)
+        results.push({ fileName: file, headings })
+      } catch {
+        continue
+      }
+    }
+
+    return results
+  }
+
+  private extractAllHeadings(nodes: import('../types/memory.js').HeadingNode[]): string[] {
+    const result: string[] = []
+    for (const node of nodes) {
+      if (node.type === 'heading') {
+        result.push(node.title)
+        if (node.children) {
+          for (const child of node.children) {
+            if (child.type === 'heading') {
+              result.push(...this.extractAllHeadings([child]))
+            }
+          }
+        }
+      }
+    }
+    return result
+  }
+
+  async appendToFile(fileName: string, title: string, content: string): Promise<string> {
+    const safeName = sanitizeFileName(fileName)
+    const filePath = join(this.memoryDir, `${safeName}.md`)
+    let existing = ''
+    try {
+      existing = await readFile(filePath, 'utf-8')
+    } catch {
+      // file does not exist yet, will create
+    }
+    const newContent = existing
+      ? `${existing}\n\n## ${title}\n\n${content}`
+      : `# ${title}\n\n${content}`
+    await writeFile(filePath, newContent, 'utf-8')
+    return filePath
+  }
+
+  async createFile(fileName: string, title: string, content: string): Promise<string> {
+    let safeName = sanitizeFileName(fileName)
+    let filePath = join(this.memoryDir, `${safeName}.md`)
+    try {
+      await access(filePath)
+      safeName = `${safeName}-${Date.now()}`
+      filePath = join(this.memoryDir, `${safeName}.md`)
+    } catch {
+      // file does not exist, use original name
+    }
+    const fileContent = `# ${title}\n\n${content}`
+    await writeFile(filePath, fileContent, 'utf-8')
+    return filePath
   }
 
   async update(filePath: string, content: string): Promise<void> {
@@ -153,7 +176,7 @@ export class MemoryStore {
     const watchers: FSWatcher[] = []
     const startWatch = (dir: string) => {
       try {
-        const watcher = watch(dir, { recursive: true }, (eventType: string, filename: string | null) => {
+        const watcher = watch(dir, (eventType: string, filename: string | null) => {
           if (!filename || !filename.endsWith('.md')) return
           const fullPath = join(dir, filename)
           if (eventType === 'rename') {

@@ -14,7 +14,9 @@ export class OpenAIEmbeddingAdapter implements EmbeddingAdapter {
   }
 
   async embed(texts: string[]): Promise<EmbeddingResponse> {
-    const url = `${this.baseUrl}/v1/embeddings`
+    const url = this.baseUrl.endsWith('/embeddings')
+      ? this.baseUrl
+      : `${this.baseUrl}/embeddings`
     const body = {
       model: this.model,
       input: texts,

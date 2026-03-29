@@ -1,6 +1,6 @@
 import type { HeadingNode, CodeBlockNode, MemoryNode } from '../types/memory.js'
-import { readdir, stat } from 'node:fs/promises'
-import { join, extname } from 'node:path'
+import { readdirDetailed } from './fs-adapter.js'
+import { join, extname } from './fs-adapter.js'
 
 export function normalizeTitle(title: string): string {
   return title
@@ -262,14 +262,14 @@ export class NodeLocator {
   private async scanDir(dir: string, results: string[], pattern?: string): Promise<void> {
     let entries
     try {
-      entries = await readdir(dir, { withFileTypes: true })
+      entries = await readdirDetailed(dir)
     } catch {
       return
     }
 
     for (const entry of entries) {
       const fullPath = join(dir, entry.name)
-      if (entry.isDirectory()) {
+      if (entry.isDirectory) {
         await this.scanDir(fullPath, results, pattern)
       } else if (extname(entry.name) === '.md') {
         if (!pattern || entry.name.toLowerCase().includes(pattern.toLowerCase())) {
