@@ -170,6 +170,26 @@ export class FBM {
     this._initialized = false
   }
 
+  async setBaseDir(baseDir: string): Promise<void> {
+    const wasInitialized = this._initialized
+    if (wasInitialized) {
+      await this.shutdown()
+    }
+
+    const memoryDir = `${baseDir}/memories`
+    this.config.memoryDir = memoryDir
+    this.config.store = {
+      ...this.config.store,
+      indexCacheFile: `${memoryDir}/.index-cache.json`,
+    }
+    this.config.embedding = {
+      ...this.config.embedding,
+      vectorCacheFile: `${memoryDir}/.vector-cache.json`,
+    }
+
+    await this.init()
+  }
+
   private ensureInitialized(): void {
     if (!this._initialized) {
       throw new Error('FBM is not initialized. Call init() first.')
