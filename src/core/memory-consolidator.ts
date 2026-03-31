@@ -3,6 +3,7 @@ import type { MemoryDocument, ConsolidationResult, MemoryRoute } from '../types/
 import type { LLMAdapter, LLMMessage } from '../types/adapter.js'
 import type { ConsolidatorConfig } from '../types/config.js'
 import { MemoryStore } from './store.js'
+import { normalizeTitle } from './node-locator.js'
 
 const CONSOLIDATION_PROMPT = `You are a memory consolidation assistant. Analyze the conversation and extract information worth remembering long-term.
 
@@ -16,7 +17,7 @@ Actions:
 Output a JSON array of objects with:
 - "file": the target file name (without .md extension). MUST use an existing file name if the information is related to any existing section in that file.
 - "title": the section heading title. For "update"/"delete", must match the EXACT existing heading title. For "append", use a clear, distinct title that does NOT overlap with any existing section.
-- "content": the extracted information as structured markdown (ignored for delete action). For "update", include ALL relevant information (old + new merged).
+- "content": the extracted information as structured markdown (ignored for delete action). For "update", provide ONLY the new or changed information — the system will automatically merge it with existing content.
 - "action": one of "append", "update", "delete"
 
 CRITICAL RULES (must follow strictly):
@@ -88,6 +89,30 @@ export class MemoryConsolidator {
 
     const result: ConsolidationResult = { memories: [], created: 0, updated: 0, deleted: 0, skipped: 0 }
 
+    const processedSections = new Map<string, Set<string>>()
+
+    const fileHasSection = (fileName: string, title: string): boolean => {
+      const normalized = normalizeTitle(title)
+      const existing = existingFiles.find(f => f.fileName.replace(/\.md$/, '') === fileName)
+      if (existing) {
+        if (existing.sections.some(s => normalizeTitle(s.heading) === normalized)) return true
+      }
+      const tracked = processedSections.get(fileName)
+      if (tracked) {
+        for (const t of tracked) {
+          if (normalizeTitle(t) === normalized) return true
+        }
+      }
+      return false
+    }
+
+    const trackSection = (fileName: string, title: string): void => {
+      if (!processedSections.has(fileName)) {
+        processedSections.set(fileName, new Set())
+      }
+      processedSections.get(fileName)!.add(title)
+    }
+
     for (const raw of rawMemories) {
       try {
         const action = raw.action || 'append'
@@ -105,27 +130,28 @@ export class MemoryConsolidator {
             continue
           }
         } else if (action === 'update') {
-          if (existingFile) {
+          if (existingFile || fileHasSection(raw.file, raw.title)) {
             filePath = await this.store.updateSection(raw.file, raw.title, raw.content)
+            trackSection(raw.file, raw.title)
           } else {
             filePath = await this.store.createFile(raw.file, raw.title, raw.content)
+            trackSection(raw.file, raw.title)
             result.created++
           }
           result.updated++
         } else {
-          if (existingFile) {
-            const hasExactSection = existingFile.sections.some(
-              s => s.heading === raw.title
-            )
-            if (hasExactSection) {
+          if (existingFile || fileHasSection(raw.file, raw.title)) {
+            if (fileHasSection(raw.file, raw.title)) {
               filePath = await this.store.updateSection(raw.file, raw.title, raw.content)
               result.updated++
             } else {
               filePath = await this.store.appendToFile(raw.file, raw.title, raw.content)
+              trackSection(raw.file, raw.title)
               result.created++
             }
           } else {
             filePath = await this.store.createFile(raw.file, raw.title, raw.content)
+            trackSection(raw.file, raw.title)
             result.created++
           }
         }

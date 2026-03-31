@@ -12,6 +12,8 @@ export interface MemorySummary {
   results: RetrievalResult[]
   summary: string
   tokenCount: number
+  keywords?: string[]
+  expandedKeywords?: string[]
 }
 
 export interface MemoryDocument {

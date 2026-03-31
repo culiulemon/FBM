@@ -113,7 +113,7 @@ describe('MemoryConsolidator', () => {
     const content = await readFile(result.memories[0].filePath!, 'utf-8')
     expect(content).toContain('Age: 29')
     expect(content).toContain('City: Shanghai')
-    expect(content).not.toContain('Age: 28')
+    expect(content).toContain('Age: 28')
   })
 
   it('should delete existing section with delete action', async () => {

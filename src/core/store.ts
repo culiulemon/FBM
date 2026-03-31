@@ -2,7 +2,7 @@ import type { MemoryDocument } from '../types/retrieval.js'
 import type { StoreConfig } from '../types/config.js'
 import { mkdir, writeFile, readFile, unlink, readdir, stat, access, join, basename, extname, watch } from './fs-adapter.js'
 import type { FSWatcher } from './fs-adapter.js'
-import { parseMarkdown } from './node-locator.js'
+import { parseMarkdown, normalizeTitle, levenshteinDistance } from './node-locator.js'
 
 const INVALID_CHARS = /[<>:"/\\|?*\x00-\x1f]/g
 const MAX_FILENAME_LEN = 200
@@ -161,21 +161,29 @@ export class MemoryStore {
     const filePath = join(this.memoryDir, `${safeName}.md`)
     const existing = await readFile(filePath, 'utf-8')
     const lines = existing.split('\n')
+    const normalizedTarget = normalizeTitle(heading)
     const newLines: string[] = []
     let replaced = false
     let i = 0
     while (i < lines.length) {
       const line = lines[i]
       const trimmed = line.trim()
-      if (!replaced && trimmed.startsWith('#') && (trimmed === `# ${heading}` || trimmed === `## ${heading}`)) {
-        newLines.push(line)
-        newLines.push('')
-        newLines.push(newContent)
-        replaced = true
+      const isExactMatch = trimmed.startsWith('#') && (trimmed === `# ${heading}` || trimmed === `## ${heading}`)
+      const isFuzzyMatch = !isExactMatch && trimmed.startsWith('#') && normalizeTitle(trimmed.replace(/^#+\s+/, '')) === normalizedTarget
+      if (!replaced && (isExactMatch || isFuzzyMatch)) {
+        const headingLine = line
+        const oldContentLines: string[] = []
         i++
         while (i < lines.length && !this.isHeadingLine(lines[i])) {
+          oldContentLines.push(lines[i])
           i++
         }
+        const oldContent = oldContentLines.join('\n').trim()
+        const merged = this.mergeContent(oldContent, newContent)
+        newLines.push(headingLine)
+        newLines.push('')
+        newLines.push(merged)
+        replaced = true
       } else {
         newLines.push(line)
         i++
@@ -189,18 +197,60 @@ export class MemoryStore {
     return filePath
   }
 
+  private mergeContent(oldContent: string, newContent: string): string {
+    if (!oldContent.trim()) return newContent
+    if (!newContent.trim()) return oldContent
+
+    const oldLines = oldContent.split('\n').filter(l => l.trim())
+    const newLines = newContent.split('\n').filter(l => l.trim())
+    const normalizedOld = oldLines.map(l => normalizeTitle(l))
+    const merged: string[] = [...oldLines]
+    const seen = new Set(normalizedOld)
+
+    let addedCount = 0
+    for (const line of newLines) {
+      const normalized = normalizeTitle(line)
+      if (seen.has(normalized)) continue
+
+      const isDuplicate = normalizedOld.some(
+        old => this.isSimilarLine(old, normalized)
+      )
+      if (isDuplicate) continue
+
+      merged.push(line)
+      seen.add(normalized)
+      addedCount++
+    }
+
+    return merged.join('\n')
+  }
+
+  private isSimilarLine(normalizedOld: string, normalizedNew: string): boolean {
+    if (!normalizedOld || !normalizedNew) return false
+    if (normalizedOld === normalizedNew) return true
+    if (normalizedOld.includes(normalizedNew) && normalizedNew.length >= 4) return true
+    if (normalizedNew.includes(normalizedOld) && normalizedOld.length >= 4) return true
+    const dist = levenshteinDistance(normalizedOld, normalizedNew)
+    if (dist <= 1 && Math.min(normalizedOld.length, normalizedNew.length) >= 6) return false
+    const maxLen = Math.max(normalizedOld.length, normalizedNew.length)
+    return maxLen > 0 && dist / maxLen < 0.15
+  }
+
   async deleteSection(fileName: string, heading: string): Promise<string> {
     const safeName = sanitizeFileName(fileName)
     const filePath = join(this.memoryDir, `${safeName}.md`)
     const existing = await readFile(filePath, 'utf-8')
     const lines = existing.split('\n')
+    const normalizedTarget = normalizeTitle(heading)
     const newLines: string[] = []
     let i = 0
     let deleted = false
     while (i < lines.length) {
       const line = lines[i]
       const trimmed = line.trim()
-      if (!deleted && trimmed.startsWith('#') && (trimmed === `# ${heading}` || trimmed === `## ${heading}`)) {
+      const isExactMatch = trimmed.startsWith('#') && (trimmed === `# ${heading}` || trimmed === `## ${heading}`)
+      const isFuzzyMatch = !isExactMatch && trimmed.startsWith('#') && normalizeTitle(trimmed.replace(/^#+\s+/, '')) === normalizedTarget
+      if (!deleted && (isExactMatch || isFuzzyMatch)) {
         deleted = true
         i++
         while (i < lines.length && !this.isHeadingLine(lines[i])) {

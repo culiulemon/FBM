@@ -36,19 +36,21 @@ export class MemoryRetriever {
     this.refineResults = deps.refineResults ?? true
   }
 
-  async retrieve(query: string): Promise<RetrievalResult[]> {
-    let keywords: string[]
+  async retrieve(query: string): Promise<{ results: RetrievalResult[]; keywords: string[]; expandedKeywords: string[] }> {
+    let keywords: string[] = []
     try {
       keywords = await this.keywordExtractor.extract(query)
-    } catch {
-      return []
+    } catch (err) {
+      console.warn('[MemoryRetriever] keyword extract failed:', err)
+      return { results: [], keywords: [], expandedKeywords: [] }
     }
 
     let expandedKeywords: string[]
     try {
       expandedKeywords = await this.keywordExtractor.expand(keywords)
-    } catch {
-      return []
+    } catch (err) {
+      console.warn('[MemoryRetriever] keyword expand failed, using raw keywords:', err)
+      expandedKeywords = keywords
     }
 
     const keywordResults = this.indexEngine.search(expandedKeywords)
@@ -60,12 +62,13 @@ export class MemoryRetriever {
       try {
         const vectorResults = await this.vectorIndex.searchByText(query, this.topK)
         vectorRetrievals = await this.resolveVectorResults(vectorResults)
-      } catch {
-        // vector search failed, continue with keyword results only
+      } catch (err) {
+        console.warn('[MemoryRetriever] vector search failed:', err)
       }
     }
 
-    return this.mergeResults(keywordRetrievals, vectorRetrievals)
+    const results = this.mergeResults(keywordRetrievals, vectorRetrievals)
+    return { results, keywords, expandedKeywords }
   }
 
   async summarize(query: string, results: RetrievalResult[]): Promise<MemorySummary> {
@@ -99,9 +102,9 @@ export class MemoryRetriever {
   }
 
   async retrieveAndSummarize(query: string): Promise<MemorySummary> {
-    const results = await this.retrieve(query)
+    const { results, keywords, expandedKeywords } = await this.retrieve(query)
     if (results.length === 0) {
-      return { query, results: [], summary: '', tokenCount: 0 }
+      return { query, results: [], summary: '', tokenCount: 0, keywords, expandedKeywords }
     }
 
     if (!this.refineResults) {
@@ -111,10 +114,13 @@ export class MemoryRetriever {
         results,
         summary: joined,
         tokenCount: this.estimateTokens(joined),
+        keywords,
+        expandedKeywords,
       }
     }
 
-    return this.summarize(query, results)
+    const summarized = await this.summarize(query, results)
+    return { ...summarized, keywords, expandedKeywords }
   }
 
   private async resolveResults(nodeRefs: NodeRef[], source: 'keyword' | 'vector' | 'both'): Promise<RetrievalResult[]> {

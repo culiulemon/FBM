@@ -113,7 +113,8 @@ export function parseMarkdown(content: string, filePath: string): HeadingNode[] 
       }
 
       while (headingStack.length > 0 && headingStack[headingStack.length - 1].level >= level) {
-        headingStack.pop()
+        const popped = headingStack.pop()!
+        popped.lineEnd = i - 1
       }
 
       if (headingStack.length > 0) {
@@ -172,6 +173,13 @@ export function parseMarkdown(content: string, filePath: string): HeadingNode[] 
 
   flushParagraph(headingStack[headingStack.length - 1] ?? null)
   flushCodeBlock(headingStack[headingStack.length - 1] ?? null)
+
+  const lastLine = lines.length - 1
+  for (const h of headingStack) {
+    if (h.lineEnd === h.lineStart) {
+      h.lineEnd = lastLine
+    }
+  }
 
   return rootHeadings
 }

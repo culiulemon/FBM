@@ -187,10 +187,9 @@ export class IndexEngine {
   }
 
   private removeNodeRefKeywords(ref: NodeRef): void {
-    const refKey = `${ref.filePath}:${ref.headingPath.join('/')}`
     for (const [token, entry] of Object.entries(this.index.keywords)) {
       entry.refs = entry.refs.filter(
-        r => !(r.filePath === ref.filePath && r.headingPath.join('/') === refKey.split(':').slice(1).join('/'))
+        r => !(r.filePath === ref.filePath && r.headingPath.join('/') === ref.headingPath.join('/'))
       )
       if (entry.refs.length === 0) {
         delete this.index.keywords[token]
