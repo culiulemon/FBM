@@ -7,7 +7,7 @@ import { NodeLocator, parseMarkdown } from './node-locator.js'
 import { VectorIndex } from './vector-index.js'
 import { readFile } from './fs-adapter.js'
 
-const SUMMARIZE_PROMPT = `You are a memory refinement assistant. Given the user's query and retrieved document fragments, filter and refine only the information directly relevant to the query. Output in the same language as the query.`
+const SUMMARIZE_PROMPT = `你是一名记忆筛选助手。根据用户的对话匹配有用的信息，禁止篡改记忆或输出带有歧义的内容，禁止任何形式的修改内容，需要找出直接相关的信息。输出内容需与查询使用相同语言，用户的问题不是问你的，你只需要把合适的记忆递交出来就行，不做回答`
 
 export class MemoryRetriever {
   private indexEngine: IndexEngine
@@ -45,22 +45,14 @@ export class MemoryRetriever {
       return { results: [], keywords: [], expandedKeywords: [] }
     }
 
-    let expandedKeywords: string[]
-    try {
-      expandedKeywords = await this.keywordExtractor.expand(keywords)
-    } catch (err) {
-      console.warn('[MemoryRetriever] keyword expand failed, using raw keywords:', err)
-      expandedKeywords = keywords
-    }
-
-    const keywordResults = this.indexEngine.search(expandedKeywords)
+    const keywordResults = this.indexEngine.search(keywords)
 
     const keywordRetrievals = await this.resolveResults(keywordResults.slice(0, this.topK), 'keyword')
 
     let vectorRetrievals: RetrievalResult[] = []
-    if (this.vectorIndex.enabled) {
+    if (this.vectorIndex.enabled && keywords.length > 0) {
       try {
-        const vectorResults = await this.vectorIndex.searchByText(query, this.topK)
+        const vectorResults = await this.vectorIndex.searchByMultipleTexts(keywords, this.topK)
         vectorRetrievals = await this.resolveVectorResults(vectorResults)
       } catch (err) {
         console.warn('[MemoryRetriever] vector search failed:', err)
@@ -68,7 +60,7 @@ export class MemoryRetriever {
     }
 
     const results = this.mergeResults(keywordRetrievals, vectorRetrievals)
-    return { results, keywords, expandedKeywords }
+    return { results, keywords, expandedKeywords: keywords }
   }
 
   async summarize(query: string, results: RetrievalResult[]): Promise<MemorySummary> {

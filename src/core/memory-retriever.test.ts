@@ -31,14 +31,13 @@ describe('MemoryRetriever', () => {
     })
 
     const results = await retriever.retrieve('test query')
-    expect(results).toHaveLength(0)
+    expect(results.results).toHaveLength(0)
   })
 
-  it('should return empty results when keyword expand fails', async () => {
-    const mockIndexEngine = { search: vi.fn() } as unknown as IndexEngine
+  it('should use extracted keywords for search', async () => {
+    const mockIndexEngine = { search: vi.fn().mockReturnValue([]) } as unknown as IndexEngine
     const mockKeywordExtractor = {
       extract: vi.fn().mockResolvedValue(['test']),
-      expand: vi.fn().mockRejectedValue(new Error('LLM unavailable')),
     } as unknown as KeywordExtractor
 
     const retriever = new MemoryRetriever({
@@ -47,7 +46,8 @@ describe('MemoryRetriever', () => {
     })
 
     const results = await retriever.retrieve('test query')
-    expect(results).toHaveLength(0)
+    expect(results.results).toHaveLength(0)
+    expect(mockIndexEngine.search).toHaveBeenCalledWith(['test'])
   })
 
   it('should return raw content when refineResults is false', async () => {

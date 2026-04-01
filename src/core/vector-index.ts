@@ -119,6 +119,29 @@ export class VectorIndex {
     return this.search(response.embeddings[0], topK, minScore)
   }
 
+  async searchByMultipleTexts(texts: string[], topK = 5, minScore = 0.5): Promise<SimilarityResult[]> {
+    if (!this.embedding || texts.length === 0) return []
+
+    const merged = new Map<string, SimilarityResult>()
+
+    for (let i = 0; i < texts.length; i += this.batchSize) {
+      const batch = texts.slice(i, i + this.batchSize)
+      const response = await this.embedding.embed(batch)
+
+      for (let j = 0; j < batch.length; j++) {
+        const results = await this.search(response.embeddings[j], topK, minScore)
+        for (const r of results) {
+          const existing = merged.get(r.entry.id)
+          if (!existing || r.score > existing.score) {
+            merged.set(r.entry.id, r)
+          }
+        }
+      }
+    }
+
+    return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, topK)
+  }
+
   async clear(): Promise<void> {
     this.store.entries.clear()
     this.store.dimension = 0
