@@ -1,6 +1,6 @@
 import type { FBMConfig } from '../types/config.js'
 import type { LLMAdapter, EmbeddingAdapter } from '../types/adapter.js'
-import type { RetrievalResult, ConsolidationResult, MemorySummary } from '../types/retrieval.js'
+import type { ConsolidationResult, MemorySummary } from '../types/retrieval.js'
 import type { ConversationMessage } from '../types/conversation.js'
 import type { HeadingNode } from '../types/memory.js'
 import { MemoryStore } from './store.js'
@@ -197,8 +197,17 @@ export class FBM {
   }
 
   private async rebuildVectors(): Promise<void> {
-    if (!this.vectorIndex.enabled || this.vectorIndex.size > 0) return
+    if (!this.vectorIndex.enabled) {
+      console.log('[FBM] Vector index disabled (no embedding adapter)')
+      return
+    }
+    if (this.vectorIndex.size > 0) {
+      console.log('[FBM] Vector index already has', this.vectorIndex.size, 'entries, skipping rebuild')
+      return
+    }
+    console.log('[FBM] Rebuilding vectors...')
     await this.addVectorsForDir(this.config.memoryDir)
+    console.log('[FBM] Vector rebuild complete, entries:', this.vectorIndex.size)
   }
 
   private async addVectorsForDir(dir: string): Promise<void> {
@@ -222,14 +231,14 @@ export class FBM {
           lineEnd: h.lineEnd,
           title: h.title,
         },
-        content: `${h.title}\n${this.nodeLocator.extractContent(h).slice(0, 1000)}`,
+        content: `${h.title}\n${this.nodeLocator.extractContent(h).slice(0, 300)}`,
       }))
 
       if (items.length > 0) {
-        await this.vectorIndex.addEntries(items)
+        await this.vectorIndex.addEntriesIncremental(items)
       }
-    } catch {
-      // skip unreadable files
+    } catch (err) {
+      console.warn('[FBM] addVectorsForFile failed for', filePath, err)
     }
   }
 

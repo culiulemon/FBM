@@ -6,11 +6,9 @@ const KEYWORD_PROMPT = `你是一个记忆仓库精灵，负责管理记忆仓�
 
 export class KeywordExtractor {
   private llm: LLMAdapter | null
-  private model: string
 
-  constructor(llm?: LLMAdapter, model?: string) {
+  constructor(llm?: LLMAdapter, _model?: string) {
     this.llm = llm ?? null
-    this.model = model ?? 'gpt-4o-mini'
   }
 
   async extract(userInput: string): Promise<string[]> {

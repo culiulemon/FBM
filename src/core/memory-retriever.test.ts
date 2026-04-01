@@ -164,7 +164,7 @@ describe('MemoryRetriever', () => {
       refineResults: true,
     })
 
-    const summary = await retriever.retrieveAndSummarize('user query about X')
+    await retriever.retrieveAndSummarize('user query about X')
     expect(llm.chat).toHaveBeenCalledOnce()
     const callArgs = (llm.chat as any).mock.calls[0][0]
     const userMsg = callArgs[1].content

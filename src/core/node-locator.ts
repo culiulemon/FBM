@@ -41,7 +41,7 @@ const CODE_FENCE_RE = /^```(\w*)\s*$/
 const CODE_CLOSE_RE = /^```\s*$/
 const LIST_RE = /^(\s*)([-*+]|\d+\.)\s+/
 
-export function parseMarkdown(content: string, filePath: string): HeadingNode[] {
+export function parseMarkdown(content: string, _filePath: string): HeadingNode[] {
   const lines = content.split('\n')
   const rootHeadings: HeadingNode[] = []
   const headingStack: HeadingNode[] = []
@@ -278,6 +278,7 @@ export class NodeLocator {
     for (const entry of entries) {
       const fullPath = join(dir, entry.name)
       if (entry.isDirectory) {
+        if (entry.name === 'corefile') continue
         await this.scanDir(fullPath, results, pattern)
       } else if (extname(entry.name) === '.md') {
         if (!pattern || entry.name.toLowerCase().includes(pattern.toLowerCase())) {

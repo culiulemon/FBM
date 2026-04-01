@@ -3,7 +3,7 @@ import type { VectorEntry, EmbeddingRef, SimilarityResult, VectorStore, Serializ
 import { readFile, writeFile } from './fs-adapter.js'
 
 function entryId(ref: EmbeddingRef): string {
-  return `${ref.filePath}:${ref.headingPath.join('/')}:${ref.lineStart}-${ref.lineEnd}`
+  return `${ref.filePath}:${ref.headingPath.join('/')}`
 }
 
 export class VectorIndex {
@@ -66,28 +66,47 @@ export class VectorIndex {
     const entries: VectorEntry[] = []
     for (let i = 0; i < items.length; i += this.batchSize) {
       const batch = items.slice(i, i + this.batchSize)
-      const texts = batch.map(b => b.content)
-      const response = await this.embedding.embed(texts)
-
-      for (let j = 0; j < batch.length; j++) {
-        const id = entryId(batch[j].ref)
-        const entry: VectorEntry = {
-          id,
-          vector: response.embeddings[j],
-          ref: batch[j].ref,
-          content: batch[j].content,
-          createdAt: Date.now(),
-        }
-        this.store.entries.set(id, entry)
-        entries.push(entry)
-        if (this.store.dimension === 0) {
-          this.store.dimension = response.embeddings[j].length
+      try {
+        const batchEntries = await this.embedBatch(batch)
+        entries.push(...batchEntries)
+      } catch {
+        for (const item of batch) {
+          try {
+            const singleEntries = await this.embedBatch([item])
+            entries.push(...singleEntries)
+          } catch {
+            console.warn('[VectorIndex] Skipping entry due to embedding error:', item.ref.title)
+          }
         }
       }
     }
 
     this.store.lastUpdated = Date.now()
     await this.save()
+    return entries
+  }
+
+  private async embedBatch(batch: Array<{ ref: EmbeddingRef; content: string }>): Promise<VectorEntry[]> {
+    const texts = batch.map(b => b.content)
+    const response = await this.embedding!.embed(texts)
+    const entries: VectorEntry[] = []
+
+    for (let j = 0; j < batch.length; j++) {
+      const id = entryId(batch[j].ref)
+      const entry: VectorEntry = {
+        id,
+        vector: response.embeddings[j],
+        ref: batch[j].ref,
+        content: batch[j].content,
+        createdAt: Date.now(),
+      }
+      this.store.entries.set(id, entry)
+      entries.push(entry)
+      if (this.store.dimension === 0) {
+        this.store.dimension = response.embeddings[j].length
+      }
+    }
+
     return entries
   }
 
@@ -99,6 +118,32 @@ export class VectorIndex {
     }
     this.store.lastUpdated = Date.now()
     await this.save()
+  }
+
+  async addEntriesIncremental(items: Array<{ ref: EmbeddingRef; content: string }>): Promise<VectorEntry[]> {
+    if (!this.embedding) return []
+
+    const newIds = new Set(items.map(it => entryId(it.ref)))
+
+    const staleIds: string[] = []
+    for (const [id, entry] of this.store.entries) {
+      if (entry.ref.filePath === items[0]?.ref.filePath && !newIds.has(id)) {
+        staleIds.push(id)
+      }
+    }
+    for (const id of staleIds) {
+      this.store.entries.delete(id)
+    }
+
+    const changed = items.filter(it => {
+      const existing = this.store.entries.get(entryId(it.ref))
+      return !existing || existing.content !== it.content
+    })
+
+    if (changed.length === 0) return []
+
+    const entries = await this.addEntries(changed)
+    return entries
   }
 
   async search(queryVector: number[], topK = 5, minScore = 0.5): Promise<SimilarityResult[]> {

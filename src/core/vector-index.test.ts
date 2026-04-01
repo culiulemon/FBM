@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { VectorIndex } from './vector-index.js'
 import type { EmbeddingAdapter } from '../types/adapter.js'
-import { writeFile, rm } from 'node:fs/promises'
+import { rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 

@@ -1,6 +1,6 @@
 import type { MemoryDocument } from '../types/retrieval.js'
 import type { StoreConfig } from '../types/config.js'
-import { mkdir, writeFile, readFile, unlink, readdir, stat, access, join, basename, extname, watch } from './fs-adapter.js'
+import { mkdir, writeFile, readFile, unlink, readdir, stat, access, join, basename, watch } from './fs-adapter.js'
 import type { FSWatcher } from './fs-adapter.js'
 import { parseMarkdown, normalizeTitle, levenshteinDistance } from './node-locator.js'
 

@@ -1,8 +1,7 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 vi.mock('./fs-adapter.js', async () => {
   return await import('./__mocks__/fs-adapter.js')
 })
-
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { MemoryStore } from './store.js'
 import { rm, readFile } from 'node:fs/promises'
 import { join } from 'node:path'

@@ -5,7 +5,7 @@ vi.mock('./fs-adapter.js', async () => {
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { MemoryConsolidator } from './memory-consolidator.js'
 import { MemoryStore } from './store.js'
-import { rm, readFile, stat } from 'node:fs/promises'
+import { rm, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { LLMAdapter, LLMResponse } from '../types/adapter.js'
@@ -226,6 +226,68 @@ describe('MemoryConsolidator', () => {
     ])
 
     expect(result.created).toBe(1)
+  })
+
+  it('should parse YAML-format response from sub-model', async () => {
+    const yamlResponse = `- file: 用户信息
+  title: 童年创伤经历
+  content: - 被狗追着跑了三里地（约1.5公里），造成深刻心理阴影
+  action: update`
+    llm = createMockLLM(yamlResponse)
+    await store.appendToFile('用户信息', '童年创伤经历', '一些旧内容')
+    const consolidator = new MemoryConsolidator(store, llm)
+
+    const messages: ConversationMessage[] = [
+      { role: 'user', content: '我小时候被狗追过', timestamp: Date.now() },
+    ]
+
+    const result = await consolidator.consolidate(messages)
+    expect(result.memories).toHaveLength(1)
+    expect(result.updated).toBe(1)
+
+    const content = await readFile(result.memories[0].filePath!, 'utf-8')
+    expect(content).toContain('被狗追着跑了三里地')
+  })
+
+  it('should parse YAML-format response with multiple items', async () => {
+    const yamlResponse = `- file: 用户信息
+  title: 基本资料
+  content: 名字: cucu
+年龄: 28
+  action: append
+- file: 项目记录
+  title: 技术栈
+  content: Tauri + Vue + TypeScript
+  action: append`
+    llm = createMockLLM(yamlResponse)
+    const consolidator = new MemoryConsolidator(store, llm)
+
+    const result = await consolidator.consolidate([
+      { role: 'user', content: '我叫cucu，做Tauri开发', timestamp: Date.now() },
+    ])
+
+    expect(result.memories).toHaveLength(2)
+    expect(result.created).toBe(2)
+  })
+
+  it('should parse YAML-format response with multiline content', async () => {
+    const yamlResponse = `- file: 开发日志
+  title: 今日进展
+  content: - 完成了记忆系统的YAML解析
+- 修复了副模型返回内容丢失的问题
+- 增加了单元测试
+  action: append`
+    llm = createMockLLM(yamlResponse)
+    const consolidator = new MemoryConsolidator(store, llm)
+
+    const result = await consolidator.consolidate([
+      { role: 'user', content: '今天修了YAML解析的bug', timestamp: Date.now() },
+    ])
+
+    expect(result.memories).toHaveLength(1)
+    const content = await readFile(result.memories[0].filePath!, 'utf-8')
+    expect(content).toContain('YAML解析')
+    expect(content).toContain('副模型返回内容丢失')
   })
 
   it('should auto-upgrade append to update when same heading exists in file', async () => {

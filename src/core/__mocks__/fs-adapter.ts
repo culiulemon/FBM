@@ -1,4 +1,4 @@
-import { mkdir, writeFile, readFile, unlink, readdir, stat as nodeStat, access as nodeAccess } from 'node:fs/promises'
+import { mkdir, writeFile, readFile, unlink, readdir, stat as nodeStat } from 'node:fs/promises'
 import { join as nodeJoin, basename as nodeBasename, extname as nodeExtname } from 'node:path'
 import { existsSync } from 'node:fs'
 
