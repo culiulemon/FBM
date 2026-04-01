@@ -12,6 +12,7 @@ export interface HeadingNode extends BaseNode {
   level: 1 | 2 | 3 | 4 | 5 | 6
   title: string
   normalizedTitle: string
+  sectionId?: string
   children: MemoryNode[]
 }
 

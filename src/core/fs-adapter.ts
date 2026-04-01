@@ -161,4 +161,31 @@ function watch(dir: string, listener: WatchListener): FSWatcher {
   }
 }
 
-export { mkdir, writeFile, readFile, unlink, readdir, readdirDetailed, stat, access, join, basename, extname, watch }
+async function readFileBinary(path: string): Promise<Uint8Array> {
+  try {
+    const base64 = await invoke<string>('fbm_read_file_binary', { path })
+    const binary = atob(base64)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i)
+    }
+    return bytes
+  } catch (e) {
+    throw new Error(String(e))
+  }
+}
+
+async function writeFileBinary(path: string, data: Uint8Array): Promise<void> {
+  try {
+    let binary = ''
+    for (let i = 0; i < data.length; i++) {
+      binary += String.fromCharCode(data[i])
+    }
+    const base64 = btoa(binary)
+    await invoke('fbm_write_file_binary', { path, data: base64 })
+  } catch (e) {
+    throw new Error(String(e))
+  }
+}
+
+export { mkdir, writeFile, readFile, readFileBinary, writeFileBinary, unlink, readdir, readdirDetailed, stat, access, join, basename, extname, watch }

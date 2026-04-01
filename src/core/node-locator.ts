@@ -112,6 +112,11 @@ export function parseMarkdown(content: string, _filePath: string): HeadingNode[]
         children: [],
       }
 
+      const idMatch = lines[i + 1]?.match(/^<!--\s*id:(ts_\d+)\s*-->$/)
+      if (idMatch) {
+        node.sectionId = idMatch[1]
+      }
+
       while (headingStack.length > 0 && headingStack[headingStack.length - 1].level >= level) {
         const popped = headingStack.pop()!
         popped.lineEnd = i - 1
@@ -188,6 +193,18 @@ export class NodeLocator {
   locateByHeadingPath(headings: HeadingNode[], path: string[]): HeadingNode | null {
     if (path.length === 0) return null
     return this.findInTree(headings, path, 0)
+  }
+
+  locateBySectionId(headings: HeadingNode[], sectionId: string): HeadingNode | null {
+    for (const h of headings) {
+      if (h.sectionId === sectionId) return h
+      const childHeadings = h.children.filter(
+        (n): n is HeadingNode => n.type === 'heading'
+      )
+      const found = this.locateBySectionId(childHeadings, sectionId)
+      if (found) return found
+    }
+    return null
   }
 
   private findInTree(headings: HeadingNode[], path: string[], depth: number): HeadingNode | null {

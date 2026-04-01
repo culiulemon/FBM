@@ -36,7 +36,7 @@ export class MemoryRetriever {
     this.refineResults = deps.refineResults ?? true
   }
 
-  async retrieve(query: string): Promise<{ results: RetrievalResult[]; keywords: string[]; expandedKeywords: string[] }> {
+  async retrieve(query: string | string[]): Promise<{ results: RetrievalResult[]; keywords: string[]; expandedKeywords: string[] }> {
     let keywords: string[] = []
     try {
       keywords = await this.keywordExtractor.extract(query)
@@ -63,11 +63,12 @@ export class MemoryRetriever {
     return { results, keywords, expandedKeywords: keywords }
   }
 
-  async summarize(query: string, results: RetrievalResult[]): Promise<MemorySummary> {
+  async summarize(query: string | string[], results: RetrievalResult[]): Promise<MemorySummary> {
+    const queryString = Array.isArray(query) ? query[query.length - 1] || '' : query
     if (!this.refineResults || !this.llm || results.length === 0) {
       const joined = results.map(r => r.content).join('\n\n---\n\n')
       return {
-        query,
+        query: queryString,
         results,
         summary: joined,
         tokenCount: this.estimateTokens(joined),
@@ -76,33 +77,35 @@ export class MemoryRetriever {
 
     const fragments = results
       .slice(0, 5)
-      .map((r, i) => `[Fragment ${i + 1}] (${r.nodeRef.title})\n${r.content}`)
+      .map((r) => `(${r.nodeRef.title})\n${r.content}`)
       .join('\n\n')
 
+    const queryForPrompt = Array.isArray(query) ? query.join(' | ') : query
     const messages: LLMMessage[] = [
       { role: 'system', content: SUMMARIZE_PROMPT },
-      { role: 'user', content: `Query: ${query}\n\nRetrieved fragments:\n${fragments}` },
+      { role: 'user', content: `Query: ${queryForPrompt}\n\nRetrieved fragments:\n${fragments}` },
     ]
 
     const response = await this.llm.chat(messages)
     return {
-      query,
+      query: queryString,
       results,
       summary: response.content,
       tokenCount: response.usage?.totalTokens ?? this.estimateTokens(response.content),
     }
   }
 
-  async retrieveAndSummarize(query: string): Promise<MemorySummary> {
+  async retrieveAndSummarize(query: string | string[]): Promise<MemorySummary> {
     const { results, keywords, expandedKeywords } = await this.retrieve(query)
+    const queryString = Array.isArray(query) ? query[query.length - 1] || '' : query
     if (results.length === 0) {
-      return { query, results: [], summary: '', tokenCount: 0, keywords, expandedKeywords }
+      return { query: queryString, results: [], summary: '', tokenCount: 0, keywords, expandedKeywords }
     }
 
     if (!this.refineResults) {
       const joined = results.map(r => r.content).join('\n\n---\n\n')
       return {
-        query,
+        query: queryString,
         results,
         summary: joined,
         tokenCount: this.estimateTokens(joined),
@@ -145,6 +148,7 @@ export class MemoryRetriever {
         depth: vr.entry.ref.headingPath.length,
         createdAt: vr.entry.createdAt,
         updatedAt: vr.entry.createdAt,
+        sectionId: vr.entry.ref.sectionId,
       }
       try {
         const content = await this.resolveNodeContent(ref)
@@ -157,7 +161,7 @@ export class MemoryRetriever {
       } catch {
         results.push({
           nodeRef: ref,
-          content: vr.entry.content,
+          content: '',
           score: vr.score,
           source: 'vector',
         })
@@ -168,8 +172,14 @@ export class MemoryRetriever {
 
   private async resolveNodeContent(ref: NodeRef): Promise<string> {
     const fileContent = await readFile(ref.filePath, 'utf-8')
+    const headings = parseMarkdown(fileContent, ref.filePath)
+    if (ref.sectionId) {
+      const node = this.nodeLocator.locateBySectionId(headings, ref.sectionId)
+      if (node) {
+        return this.nodeLocator.extractContent(node)
+      }
+    }
     if (ref.headingPath.length > 0) {
-      const headings = parseMarkdown(fileContent, ref.filePath)
       const node = this.nodeLocator.locateByHeadingPath(headings, ref.headingPath)
       if (node) {
         return this.nodeLocator.extractContent(node)

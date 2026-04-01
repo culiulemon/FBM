@@ -1,8 +1,10 @@
 import type { MemoryDocument } from '../types/retrieval.js'
 import type { StoreConfig } from '../types/config.js'
+import type { NodeRef } from '../types/index.js'
 import { mkdir, writeFile, readFile, unlink, readdir, stat, access, join, basename, watch } from './fs-adapter.js'
+import { AsyncMutex } from './async-mutex.js'
 import type { FSWatcher } from './fs-adapter.js'
-import { parseMarkdown, normalizeTitle, levenshteinDistance } from './node-locator.js'
+import { NodeLocator, parseMarkdown, normalizeTitle, levenshteinDistance } from './node-locator.js'
 
 const INVALID_CHARS = /[<>:"/\\|?*\x00-\x1f]/g
 const MAX_FILENAME_LEN = 200
@@ -17,10 +19,21 @@ function sanitizeFileName(title: string): string {
 export class MemoryStore {
   private memoryDir: string
   private storeConfig: StoreConfig
+  private fileLocks = new Map<string, AsyncMutex>()
+  private nodeLocator = new NodeLocator()
 
   constructor(memoryDir: string, storeConfig?: StoreConfig) {
     this.memoryDir = memoryDir
     this.storeConfig = storeConfig ?? {}
+  }
+
+  private getLock(filePath: string): AsyncMutex {
+    let lock = this.fileLocks.get(filePath)
+    if (!lock) {
+      lock = new AsyncMutex()
+      this.fileLocks.set(filePath, lock)
+    }
+    return lock
   }
 
   async init(): Promise<void> {
@@ -35,9 +48,14 @@ export class MemoryStore {
     keyword?: string
     since?: number
     path?: string
+    nodeRefs?: NodeRef[]
   } = {}): Promise<MemoryDocument[]> {
     if (options.path) {
       return this.readSingleFile(options.path)
+    }
+
+    if (options.nodeRefs && options.nodeRefs.length > 0) {
+      return this.readByNodeRefs(options.nodeRefs)
     }
 
     const results: MemoryDocument[] = []
@@ -72,6 +90,52 @@ export class MemoryStore {
     }
 
     return results.sort((a, b) => b.updatedAt - a.updatedAt)
+  }
+
+  private async readByNodeRefs(nodeRefs: NodeRef[]): Promise<MemoryDocument[]> {
+    const results: MemoryDocument[] = []
+    const fileMap = new Map<string, NodeRef[]>()
+    for (const ref of nodeRefs) {
+      const refs = fileMap.get(ref.filePath)
+      if (refs) refs.push(ref)
+      else fileMap.set(ref.filePath, [ref])
+    }
+
+    for (const [filePath, refs] of fileMap) {
+      try {
+        const content = await readFile(filePath, 'utf-8')
+        const headings = parseMarkdown(content, filePath)
+        for (const ref of refs) {
+          const node = ref.headingPath.length > 0
+            ? this.nodeLocator.locateByHeadingPath(headings, ref.headingPath)
+            : null
+          if (node) {
+            results.push({
+              title: ref.title,
+              content: this.nodeLocator.extractContent(node),
+              filePath,
+              fileName: basename(filePath),
+              createdAt: ref.createdAt,
+              updatedAt: ref.updatedAt,
+            })
+          } else {
+            const lines = content.split('\n')
+            results.push({
+              title: ref.title,
+              content: lines.slice(ref.lineStart, ref.lineEnd + 1).join('\n'),
+              filePath,
+              fileName: basename(filePath),
+              createdAt: ref.createdAt,
+              updatedAt: ref.updatedAt,
+            })
+          }
+        }
+      } catch {
+        continue
+      }
+    }
+
+    return results
   }
 
   private async readSingleFile(filePath: string): Promise<MemoryDocument[]> {
@@ -143,15 +207,23 @@ export class MemoryStore {
   async appendToFile(fileName: string, title: string, content: string): Promise<string> {
     const safeName = sanitizeFileName(fileName)
     const filePath = join(this.memoryDir, `${safeName}.md`)
+    const release = await this.getLock(filePath).acquire()
+    try {
+      return await this.appendToFileUnlocked(filePath, title, content)
+    } finally {
+      release()
+    }
+  }
+
+  private async appendToFileUnlocked(filePath: string, title: string, content: string): Promise<string> {
     let existing = ''
     try {
       existing = await readFile(filePath, 'utf-8')
     } catch {
-      // file does not exist yet, will create
     }
     const newContent = existing
-      ? `${existing}\n\n## ${title}\n\n${content}`
-      : `# ${title}\n\n${content}`
+      ? `${existing}\n\n## ${title}\n\n<!-- id:ts_${Date.now()} -->\n\n${content}`
+      : `# ${title}\n\n<!-- id:ts_${Date.now()} -->\n\n${content}`
     await writeFile(filePath, newContent, 'utf-8')
     return filePath
   }
@@ -159,42 +231,55 @@ export class MemoryStore {
   async updateSection(fileName: string, heading: string, newContent: string): Promise<string> {
     const safeName = sanitizeFileName(fileName)
     const filePath = join(this.memoryDir, `${safeName}.md`)
-    const existing = await readFile(filePath, 'utf-8')
-    const lines = existing.split('\n')
-    const normalizedTarget = normalizeTitle(heading)
-    const newLines: string[] = []
-    let replaced = false
-    let i = 0
-    while (i < lines.length) {
-      const line = lines[i]
-      const trimmed = line.trim()
-      const isExactMatch = trimmed.startsWith('#') && (trimmed === `# ${heading}` || trimmed === `## ${heading}`)
-      const isFuzzyMatch = !isExactMatch && trimmed.startsWith('#') && normalizeTitle(trimmed.replace(/^#+\s+/, '')) === normalizedTarget
-      if (!replaced && (isExactMatch || isFuzzyMatch)) {
-        const headingLine = line
-        const oldContentLines: string[] = []
-        i++
-        while (i < lines.length && !this.isHeadingLine(lines[i])) {
-          oldContentLines.push(lines[i])
+    const release = await this.getLock(filePath).acquire()
+    try {
+      const existing = await readFile(filePath, 'utf-8')
+      const lines = existing.split('\n')
+      const normalizedTarget = normalizeTitle(heading)
+      const newLines: string[] = []
+      let replaced = false
+      let i = 0
+      while (i < lines.length) {
+        const line = lines[i]
+        const trimmed = line.trim()
+        const isExactMatch = trimmed.startsWith('#') && (trimmed === `# ${heading}` || trimmed === `## ${heading}`)
+        const isFuzzyMatch = !isExactMatch && trimmed.startsWith('#') && normalizeTitle(trimmed.replace(/^#+\s+/, '')) === normalizedTarget
+        if (!replaced && (isExactMatch || isFuzzyMatch)) {
+          const headingLine = line
+          const oldContentLines: string[] = []
+          i++
+          while (i < lines.length && !this.isHeadingLine(lines[i])) {
+            oldContentLines.push(lines[i])
+            i++
+          }
+          const sectionIdLine = oldContentLines.find(l => /^<!--\s*id:ts_\d+\s*-->$/.test(l.trim()))
+          const oldContentClean = oldContentLines
+            .filter(l => !/^<!--\s*id:ts_\d+\s*-->$/.test(l.trim()))
+            .join('\n')
+            .trim()
+          const merged = this.mergeContent(oldContentClean, newContent)
+          newLines.push(headingLine)
+          newLines.push('')
+          if (sectionIdLine) {
+            newLines.push(sectionIdLine.trim())
+            newLines.push('')
+          }
+          newLines.push(merged)
+          replaced = true
+        } else {
+          newLines.push(line)
           i++
         }
-        const oldContent = oldContentLines.join('\n').trim()
-        const merged = this.mergeContent(oldContent, newContent)
-        newLines.push(headingLine)
-        newLines.push('')
-        newLines.push(merged)
-        replaced = true
-      } else {
-        newLines.push(line)
-        i++
       }
+      if (!replaced) {
+        return await this.appendToFileUnlocked(filePath, heading, newContent)
+      }
+      const updated = newLines.join('\n')
+      await writeFile(filePath, updated, 'utf-8')
+      return filePath
+    } finally {
+      release()
     }
-    if (!replaced) {
-      return this.appendToFile(fileName, heading, newContent)
-    }
-    const updated = newLines.join('\n')
-    await writeFile(filePath, updated, 'utf-8')
-    return filePath
   }
 
   private mergeContent(oldContent: string, newContent: string): string {
@@ -239,36 +324,41 @@ export class MemoryStore {
   async deleteSection(fileName: string, heading: string): Promise<string> {
     const safeName = sanitizeFileName(fileName)
     const filePath = join(this.memoryDir, `${safeName}.md`)
-    const existing = await readFile(filePath, 'utf-8')
-    const lines = existing.split('\n')
-    const normalizedTarget = normalizeTitle(heading)
-    const newLines: string[] = []
-    let i = 0
-    let deleted = false
-    while (i < lines.length) {
-      const line = lines[i]
-      const trimmed = line.trim()
-      const isExactMatch = trimmed.startsWith('#') && (trimmed === `# ${heading}` || trimmed === `## ${heading}`)
-      const isFuzzyMatch = !isExactMatch && trimmed.startsWith('#') && normalizeTitle(trimmed.replace(/^#+\s+/, '')) === normalizedTarget
-      if (!deleted && (isExactMatch || isFuzzyMatch)) {
-        deleted = true
-        i++
-        while (i < lines.length && !this.isHeadingLine(lines[i])) {
+    const release = await this.getLock(filePath).acquire()
+    try {
+      const existing = await readFile(filePath, 'utf-8')
+      const lines = existing.split('\n')
+      const normalizedTarget = normalizeTitle(heading)
+      const newLines: string[] = []
+      let i = 0
+      let deleted = false
+      while (i < lines.length) {
+        const line = lines[i]
+        const trimmed = line.trim()
+        const isExactMatch = trimmed.startsWith('#') && (trimmed === `# ${heading}` || trimmed === `## ${heading}`)
+        const isFuzzyMatch = !isExactMatch && trimmed.startsWith('#') && normalizeTitle(trimmed.replace(/^#+\s+/, '')) === normalizedTarget
+        if (!deleted && (isExactMatch || isFuzzyMatch)) {
+          deleted = true
+          i++
+          while (i < lines.length && !this.isHeadingLine(lines[i])) {
+            i++
+          }
+        } else {
+          newLines.push(line)
           i++
         }
-      } else {
-        newLines.push(line)
-        i++
       }
-    }
-    if (!deleted) return filePath
-    const updated = newLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
-    if (!updated) {
-      await unlink(filePath)
+      if (!deleted) return filePath
+      const updated = newLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+      if (!updated) {
+        await unlink(filePath)
+        return filePath
+      }
+      await writeFile(filePath, updated, 'utf-8')
       return filePath
+    } finally {
+      release()
     }
-    await writeFile(filePath, updated, 'utf-8')
-    return filePath
   }
 
   private isHeadingLine(line: string): boolean {
@@ -279,16 +369,20 @@ export class MemoryStore {
   async createFile(fileName: string, title: string, content: string): Promise<string> {
     let safeName = sanitizeFileName(fileName)
     let filePath = join(this.memoryDir, `${safeName}.md`)
+    const release = await this.getLock(filePath).acquire()
     try {
-      await access(filePath)
-      safeName = `${safeName}-${Date.now()}`
-      filePath = join(this.memoryDir, `${safeName}.md`)
-    } catch {
-      // file does not exist, use original name
+      try {
+        await access(filePath)
+        safeName = `${safeName}-${Date.now()}`
+        filePath = join(this.memoryDir, `${safeName}.md`)
+      } catch {
+      }
+      const fileContent = `# ${title}\n\n<!-- id:ts_${Date.now()} -->\n\n${content}`
+      await writeFile(filePath, fileContent, 'utf-8')
+      return filePath
+    } finally {
+      release()
     }
-    const fileContent = `# ${title}\n\n${content}`
-    await writeFile(filePath, fileContent, 'utf-8')
-    return filePath
   }
 
   async update(filePath: string, content: string): Promise<void> {

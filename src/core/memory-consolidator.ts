@@ -66,6 +66,15 @@ function isValidMemoryRoute(obj: unknown): obj is MemoryRoute {
   return typeof r.file === 'string' && typeof r.title === 'string' && typeof r.content === 'string'
 }
 
+function tryParseStringItems(arr: unknown[]): unknown[] {
+  return arr.map(item => {
+    if (typeof item === 'string') {
+      try { return JSON.parse(item) } catch { return item }
+    }
+    return item
+  })
+}
+
 function extractAndParseJSON(text: string): unknown[] {
   const trimmed = text.trim()
 
@@ -73,7 +82,7 @@ function extractAndParseJSON(text: string): unknown[] {
   if (arrayMatch) {
     try {
       const parsed = JSON.parse(arrayMatch[0])
-      if (Array.isArray(parsed)) return parsed
+      if (Array.isArray(parsed)) return tryParseStringItems(parsed)
     } catch {}
   }
 
@@ -90,7 +99,7 @@ function extractAndParseJSON(text: string): unknown[] {
 
   try {
     const parsed = JSON.parse(trimmed)
-    if (Array.isArray(parsed)) return parsed
+    if (Array.isArray(parsed)) return tryParseStringItems(parsed)
     if (typeof parsed === 'object' && parsed !== null) return [parsed]
   } catch {}
 

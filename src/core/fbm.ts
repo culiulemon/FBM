@@ -105,7 +105,7 @@ export class FBM {
     this._initialized = true
   }
 
-  async retrieve(query: string): Promise<MemorySummary> {
+  async retrieve(query: string | string[]): Promise<MemorySummary> {
     this.ensureInitialized()
     return this.retriever.retrieveAndSummarize(query)
   }
@@ -184,7 +184,7 @@ export class FBM {
     }
     this.config.embedding = {
       ...this.config.embedding,
-      vectorCacheFile: `${memoryDir}/.vector-cache.json`,
+      vectorCacheFile: `${memoryDir}/.vector-meta.json`,
     }
 
     await this.init()
@@ -223,15 +223,17 @@ export class FBM {
       const content = await readFile(filePath, 'utf-8')
       const headings = parseMarkdown(content, filePath)
 
-      const items = headings.map((h: HeadingNode) => ({
+      const flat = this.flattenHeadings(headings, [])
+      const items = flat.map(({ node, path }) => ({
         ref: {
           filePath,
-          headingPath: this.buildHeadingPath(h),
-          lineStart: h.lineStart,
-          lineEnd: h.lineEnd,
-          title: h.title,
+          headingPath: path,
+          lineStart: node.lineStart,
+          lineEnd: node.lineEnd,
+          title: node.title,
+          sectionId: node.sectionId,
         },
-        content: `${h.title}\n${this.nodeLocator.extractContent(h).slice(0, 300)}`,
+        content: `${node.title}\n${this.nodeLocator.extractContent(node)}`,
       }))
 
       if (items.length > 0) {
@@ -242,17 +244,17 @@ export class FBM {
     }
   }
 
-  private buildHeadingPath(heading: HeadingNode): string[] {
-    const path: string[] = [heading.title]
-    let current = heading
-    while (current.children) {
-      const child = current.children.find(
+  private flattenHeadings(nodes: HeadingNode[], parentPath: string[]): Array<{ node: HeadingNode; path: string[] }> {
+    const result: Array<{ node: HeadingNode; path: string[] }> = []
+    for (const node of nodes) {
+      const path = [...parentPath, node.title]
+      result.push({ node, path })
+      const childHeadings = node.children.filter(
         (n): n is HeadingNode => n.type === 'heading'
       )
-      if (!child) break
-      path.push(child.title)
-      current = child
+      result.push(...this.flattenHeadings(childHeadings, path))
     }
-    return path
+    return result
   }
+
 }

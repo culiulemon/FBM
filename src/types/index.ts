@@ -6,6 +6,7 @@ export interface NodeRef {
   lineStart: number
   lineEnd: number
   title: string
+  sectionId?: string
   depth: number
   createdAt: number
   updatedAt: number

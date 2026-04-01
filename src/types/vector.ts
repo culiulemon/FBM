@@ -1,8 +1,7 @@
 export interface VectorEntry {
   id: string
-  vector: number[]
+  vector: Float32Array
   ref: EmbeddingRef
-  content: string
   createdAt: number
 }
 
@@ -12,6 +11,7 @@ export interface EmbeddingRef {
   lineStart: number
   lineEnd: number
   title: string
+  sectionId?: string
 }
 
 export interface SimilarityResult {
@@ -25,16 +25,16 @@ export interface VectorStore {
   lastUpdated: number
 }
 
-export interface SerializedVectorStore {
-  entries: Record<string, SerializedVectorEntry>
-  dimension: number
-  lastUpdated: number
+export interface VectorMeta {
+  id: string
+  ref: EmbeddingRef
+  createdAt: number
+  offset: number
+  contentHash: string
 }
 
-export interface SerializedVectorEntry {
-  id: string
-  vector: number[]
-  ref: EmbeddingRef
-  content: string
-  createdAt: number
+export interface VectorMetaStore {
+  dimension: number
+  lastUpdated: number
+  entries: VectorMeta[]
 }
