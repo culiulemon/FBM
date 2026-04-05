@@ -1,19 +1,19 @@
 export interface FBMConfig {
   memoryDir: string
-  store?: StoreConfig
+  qdrant?: QdrantConfig
   embedding?: EmbeddingConfig
   retrieval?: RetrievalConfig
-  consolidator?: ConsolidatorConfig
+  lifecycle?: LifecycleConfig
 }
 
-export interface StoreConfig {
-  indexCacheFile?: string
-  watchFiles?: boolean
+export interface QdrantConfig {
+  port?: number
+  memoryBlocksCollection?: string
+  memoryDirectoryCollection?: string
 }
 
 export interface EmbeddingConfig {
   batchSize?: number
-  vectorCacheFile?: string
 }
 
 export interface RetrievalConfig {
@@ -21,8 +21,18 @@ export interface RetrievalConfig {
   retrievalTopK?: number
   minScore?: number
   maxContextTokens?: number
+  directoryThreshold?: number
 }
 
-export interface ConsolidatorConfig {
-  maxSummaryTokens?: number
+export interface LifecycleConfig {
+  enableExpiration?: boolean
+  mergeCheckInterval?: number
+  expirationThresholds?: ExpirationThresholds
+}
+
+export interface ExpirationThresholds {
+  critical: number
+  high: number
+  normal: number
+  low: number
 }

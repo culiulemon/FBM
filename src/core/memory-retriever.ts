@@ -1,217 +1,232 @@
-import type { NodeRef } from '../types/index.js'
-import type { RetrievalResult, MemorySummary } from '../types/retrieval.js'
 import type { LLMAdapter, LLMMessage } from '../types/adapter.js'
-import { IndexEngine } from './index-engine.js'
-import { KeywordExtractor } from './keyword-extractor.js'
-import { NodeLocator, parseMarkdown } from './node-locator.js'
-import { VectorIndex } from './vector-index.js'
-import { readFile } from './fs-adapter.js'
+import type { MemorySummary, BlockRetrievalResult } from '../types/retrieval.js'
+import type { QdrantStore } from './qdrant-store.js'
+import type { DirectoryManager } from './directory-manager.js'
+import type { BlockLifecycleManager } from './block-lifecycle.js'
 
-const SUMMARIZE_PROMPT = `你是一名记忆筛选助手。根据用户的对话匹配有用的信息，禁止篡改记忆或输出带有歧义的内容，禁止任何形式的修改内容，需要找出直接相关的信息。输出内容需与查询使用相同语言，用户的问题不是问你的，你只需要把合适的记忆递交出来就行，不做回答`
+const DIRECTORY_BROWSE_PROMPT = `你是一个记忆检索助手。以下是当前的记忆目录结构，请根据用户的查询，选择最相关的记忆分区。
+
+## 记忆目录
+{directoryText}
+
+## 用户查询
+{query}
+
+## 输出格式
+输出JSON，包含你选择的候选分区ID列表：
+{
+  "selectedBlockIds": ["block_id_1", "block_id_2"],
+  "reasoning": "简述选择理由"
+}
+
+选择标准：
+- 选择与用户查询话题最相关的分区
+- 宁可多选不要漏选，可以选1-5个分区
+- 如果没有任何相关分区，返回空数组
+
+只输出JSON，不要输出任何其他内容。`
+
+const REFINE_PROMPT = `你是一个记忆筛选助手。系统从记忆库中检索到了以下记忆内容，请根据当前对话上下文，筛选出与对话直接相关的信息。
+
+## 当前对话上下文
+{context}
+
+## 检索到的记忆内容
+{retrievedContent}
+
+## 输出要求
+1. 筛选出与当前对话直接相关的记忆信息
+2. 去除无关的噪声内容
+3. 用简洁、结构化的方式组织筛选结果
+4. 保留所有可能有用的事实细节
+5. 如果检索到的内容与当前对话完全无关，输出"无相关记忆"
+
+直接输出筛选结果文本，不要输出JSON。`
 
 export class MemoryRetriever {
-  private indexEngine: IndexEngine
-  private keywordExtractor: KeywordExtractor
-  private nodeLocator: NodeLocator
-  private vectorIndex: VectorIndex
-  private llm: LLMAdapter | null
+  private llm: LLMAdapter
+  private store: QdrantStore
+  private directoryManager: DirectoryManager
+  private lifecycle: BlockLifecycleManager
   private topK: number
+  private minScore: number
   private refineResults: boolean
 
-  constructor(deps: {
-    indexEngine: IndexEngine
-    keywordExtractor: KeywordExtractor
-    nodeLocator?: NodeLocator
-    vectorIndex?: VectorIndex
-    llm?: LLMAdapter
-    topK?: number
-    refineResults?: boolean
-  }) {
-    this.indexEngine = deps.indexEngine
-    this.keywordExtractor = deps.keywordExtractor
-    this.nodeLocator = deps.nodeLocator ?? new NodeLocator()
-    this.vectorIndex = deps.vectorIndex ?? new VectorIndex()
-    this.llm = deps.llm ?? null
-    this.topK = deps.topK ?? 10
-    this.refineResults = deps.refineResults ?? true
+  constructor(
+    llm: LLMAdapter,
+    store: QdrantStore,
+    directoryManager: DirectoryManager,
+    lifecycle: BlockLifecycleManager,
+    options?: { topK?: number; minScore?: number; refineResults?: boolean },
+  ) {
+    this.llm = llm
+    this.store = store
+    this.directoryManager = directoryManager
+    this.lifecycle = lifecycle
+    this.topK = options?.topK ?? 10
+    this.minScore = options?.minScore ?? 0.3
+    this.refineResults = options?.refineResults ?? true
   }
 
-  async retrieve(query: string | string[]): Promise<{ results: RetrievalResult[]; keywords: string[]; expandedKeywords: string[] }> {
-    let keywords: string[] = []
+  async retrieve(query: string, context?: string): Promise<MemorySummary> {
+    if (!query || query.trim().length === 0) {
+      return { query, results: [], summary: '', tokenCount: 0 }
+    }
+
+    console.log('[Retriever] Starting retrieve for query:', query.slice(0, 100))
+
+    const candidateBlockIds = await this.directoryPhase(query)
+    console.log('[Retriever] directoryPhase returned', candidateBlockIds.length, 'candidates:', candidateBlockIds)
+
+    const searchResults = await this.hybridSearchPhase(query, candidateBlockIds)
+    console.log('[Retriever] hybridSearchPhase returned', searchResults.length, 'results')
+
+    const blockIds = [...new Set(searchResults.map(r => r.blockId))]
+    console.log('[Retriever] Unique blockIds:', blockIds)
+
+    const fullBlocks = await this.fetchFullBlocks(blockIds)
+    console.log('[Retriever] fetchFullBlocks returned', fullBlocks.length, 'blocks')
+
+    for (const blockId of blockIds) {
+      await this.lifecycle.onBlockAccessed(blockId).catch(() => {})
+    }
+
+    let summary: string
+    if (this.refineResults && fullBlocks.length > 0) {
+      summary = await this.refinePhase(query, fullBlocks, context)
+    } else {
+      summary = fullBlocks
+        .map(b => `## ${b.directoryEntry}\n${b.summary}`)
+        .join('\n\n')
+    }
+
+    const results: BlockRetrievalResult[] = searchResults.map(r => ({
+      blockId: r.blockId,
+      directoryEntry: '',
+      category: '',
+      subCategory: '',
+      content: r.keywordSentence,
+      score: r.score,
+      source: r.source,
+    }))
+
+    const keywords = [...new Set(searchResults.map(r => r.keywordSentence).filter(Boolean))]
+
+    return {
+      query,
+      results,
+      summary,
+      tokenCount: summary.length,
+      keywords,
+    }
+  }
+
+  private async directoryPhase(query: string): Promise<string[]> {
     try {
-      keywords = await this.keywordExtractor.extract(query)
-    } catch (err) {
-      console.warn('[MemoryRetriever] keyword extract failed:', err)
-      return { results: [], keywords: [], expandedKeywords: [] }
-    }
+      const directoryText = await this.directoryManager.getDirectoryTextForLLM()
 
-    const keywordResults = this.indexEngine.search(keywords)
-
-    const keywordRetrievals = await this.resolveResults(keywordResults.slice(0, this.topK), 'keyword')
-
-    let vectorRetrievals: RetrievalResult[] = []
-    if (this.vectorIndex.enabled && keywords.length > 0) {
-      try {
-        const vectorResults = await this.vectorIndex.searchByMultipleTexts(keywords, this.topK)
-        vectorRetrievals = await this.resolveVectorResults(vectorResults)
-      } catch (err) {
-        console.warn('[MemoryRetriever] vector search failed:', err)
+      if (directoryText.includes('暂无记忆目录')) {
+        return []
       }
-    }
 
-    const results = this.mergeResults(keywordRetrievals, vectorRetrievals)
-    return { results, keywords, expandedKeywords: keywords }
+      const prompt = DIRECTORY_BROWSE_PROMPT
+        .replace('{directoryText}', directoryText)
+        .replace('{query}', query)
+
+      const messages: LLMMessage[] = [
+        { role: 'system', content: prompt },
+      ]
+
+      const response = await this.llm.chat(messages, { temperature: 0.3 })
+      const parsed = this.parseBlockIds(response.content)
+      return parsed
+    } catch {
+      return []
+    }
   }
 
-  async summarize(query: string | string[], results: RetrievalResult[]): Promise<MemorySummary> {
-    const queryString = Array.isArray(query) ? query[query.length - 1] || '' : query
-    if (!this.refineResults || !this.llm || results.length === 0) {
-      const joined = results.map(r => r.content).join('\n\n---\n\n')
-      return {
-        query: queryString,
-        results,
-        summary: joined,
-        tokenCount: this.estimateTokens(joined),
+  private parseBlockIds(content: string): string[] {
+    const trimmed = content.trim()
+    const jsonMatch = trimmed.match(/\{[\s\S]*\}/)
+    if (!jsonMatch) return []
+
+    try {
+      const parsed = JSON.parse(jsonMatch[0])
+      if (Array.isArray(parsed.selectedBlockIds)) {
+        return parsed.selectedBlockIds
+          .map((id: unknown) => typeof id === 'string' ? id.replace(/^block:/, '') : id)
+          .filter((id: unknown) => typeof id === 'string')
+      }
+    } catch {
+      // fall through
+    }
+    return []
+  }
+
+  private async hybridSearchPhase(
+    query: string,
+    candidateBlockIds: string[],
+  ): Promise<Array<{ blockId: string; keywordSentence: string; score: number; source: 'dense' | 'sparse' | 'hybrid' }>> {
+    try {
+      return await this.store.searchHybrid(query, candidateBlockIds, this.topK, this.minScore)
+    } catch {
+      try {
+        const denseResults = await this.store.searchDenseOnly(query, candidateBlockIds, this.topK, this.minScore)
+        return denseResults.map(r => ({
+          blockId: r.blockId,
+          keywordSentence: '',
+          score: r.score,
+          source: 'dense' as const,
+        }))
+      } catch {
+        return []
       }
     }
+  }
 
-    const fragments = results
-      .slice(0, 5)
-      .map((r) => `(${r.nodeRef.title})\n${r.content}`)
-      .join('\n\n')
+  private async fetchFullBlocks(blockIds: string[]): Promise<Array<{
+    blockId: string
+    directoryEntry: string
+    summary: string
+    rawContents: string[]
+    keywordSentences: string[]
+  }>> {
+    const blocks = []
+    for (const blockId of blockIds) {
+      try {
+        const data = await this.store.assembleBlockData(blockId)
+        if (data) {
+          blocks.push(data)
+        }
+      } catch {
+        // skip failed blocks
+      }
+    }
+    return blocks
+  }
 
-    const queryForPrompt = Array.isArray(query) ? query.join(' | ') : query
+  private async refinePhase(
+    query: string,
+    blocks: Array<{ directoryEntry: string; summary: string; rawContents: string[] }>,
+    context?: string,
+  ): Promise<string> {
+    const retrievedContent = blocks
+      .map(b => `### ${b.directoryEntry}\n${b.summary}\n\n原始内容片段:\n${b.rawContents.slice(0, 3).join('\n')}`)
+      .join('\n\n---\n\n')
+
+    const prompt = REFINE_PROMPT
+      .replace('{context}', context ?? query)
+      .replace('{retrievedContent}', retrievedContent)
+
     const messages: LLMMessage[] = [
-      { role: 'system', content: SUMMARIZE_PROMPT },
-      { role: 'user', content: `Query: ${queryForPrompt}\n\nRetrieved fragments:\n${fragments}` },
+      { role: 'system', content: prompt },
     ]
 
-    const response = await this.llm.chat(messages)
-    return {
-      query: queryString,
-      results,
-      summary: response.content,
-      tokenCount: response.usage?.totalTokens ?? this.estimateTokens(response.content),
+    try {
+      const response = await this.llm.chat(messages, { temperature: 0.3 })
+      return response.content
+    } catch {
+      return retrievedContent
     }
-  }
-
-  async retrieveAndSummarize(query: string | string[]): Promise<MemorySummary> {
-    const { results, keywords, expandedKeywords } = await this.retrieve(query)
-    const queryString = Array.isArray(query) ? query[query.length - 1] || '' : query
-    if (results.length === 0) {
-      return { query: queryString, results: [], summary: '', tokenCount: 0, keywords, expandedKeywords }
-    }
-
-    if (!this.refineResults) {
-      const joined = results.map(r => r.content).join('\n\n---\n\n')
-      return {
-        query: queryString,
-        results,
-        summary: joined,
-        tokenCount: this.estimateTokens(joined),
-        keywords,
-        expandedKeywords,
-      }
-    }
-
-    const summarized = await this.summarize(query, results)
-    return { ...summarized, keywords, expandedKeywords }
-  }
-
-  private async resolveResults(nodeRefs: NodeRef[], source: 'keyword' | 'vector' | 'both'): Promise<RetrievalResult[]> {
-    const results: RetrievalResult[] = []
-    for (const ref of nodeRefs) {
-      try {
-        const content = await this.resolveNodeContent(ref)
-        results.push({
-          nodeRef: ref,
-          content,
-          score: 1.0,
-          source,
-        })
-      } catch {
-        // skip unresolvable nodes
-      }
-    }
-    return results
-  }
-
-  private async resolveVectorResults(vectorResults: Array<{ entry: import('../types/vector.js').VectorEntry; score: number }>): Promise<RetrievalResult[]> {
-    const results: RetrievalResult[] = []
-    for (const vr of vectorResults) {
-      const ref: NodeRef = {
-        filePath: vr.entry.ref.filePath,
-        headingPath: vr.entry.ref.headingPath,
-        lineStart: vr.entry.ref.lineStart,
-        lineEnd: vr.entry.ref.lineEnd,
-        title: vr.entry.ref.title,
-        depth: vr.entry.ref.headingPath.length,
-        createdAt: vr.entry.createdAt,
-        updatedAt: vr.entry.createdAt,
-        sectionId: vr.entry.ref.sectionId,
-      }
-      try {
-        const content = await this.resolveNodeContent(ref)
-        results.push({
-          nodeRef: ref,
-          content,
-          score: vr.score,
-          source: 'vector',
-        })
-      } catch {
-        results.push({
-          nodeRef: ref,
-          content: '',
-          score: vr.score,
-          source: 'vector',
-        })
-      }
-    }
-    return results
-  }
-
-  private async resolveNodeContent(ref: NodeRef): Promise<string> {
-    const fileContent = await readFile(ref.filePath, 'utf-8')
-    const headings = parseMarkdown(fileContent, ref.filePath)
-    if (ref.sectionId) {
-      const node = this.nodeLocator.locateBySectionId(headings, ref.sectionId)
-      if (node) {
-        return this.nodeLocator.extractContent(node)
-      }
-    }
-    if (ref.headingPath.length > 0) {
-      const node = this.nodeLocator.locateByHeadingPath(headings, ref.headingPath)
-      if (node) {
-        return this.nodeLocator.extractContent(node)
-      }
-    }
-    const lines = fileContent.split('\n')
-    return lines.slice(ref.lineStart, ref.lineEnd + 1).join('\n')
-  }
-
-  private mergeResults(keywordResults: RetrievalResult[], vectorResults: RetrievalResult[]): RetrievalResult[] {
-    const seen = new Map<string, RetrievalResult>()
-
-    for (const r of keywordResults) {
-      const key = `${r.nodeRef.filePath}:${r.nodeRef.headingPath.join('/')}`
-      seen.set(key, { ...r, source: r.source })
-    }
-
-    for (const r of vectorResults) {
-      const key = `${r.nodeRef.filePath}:${r.nodeRef.headingPath.join('/')}`
-      const existing = seen.get(key)
-      if (existing) {
-        existing.score = Math.max(existing.score, r.score)
-        existing.source = 'both'
-      } else {
-        seen.set(key, r)
-      }
-    }
-
-    return [...seen.values()].sort((a, b) => b.score - a.score)
-  }
-
-  private estimateTokens(text: string): number {
-    return Math.ceil(text.length / 4)
   }
 }

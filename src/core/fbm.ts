@@ -1,29 +1,23 @@
 import type { FBMConfig } from '../types/config.js'
 import type { LLMAdapter, EmbeddingAdapter } from '../types/adapter.js'
-import type { ConsolidationResult, MemorySummary } from '../types/retrieval.js'
+import type { ConsolidationResult } from '../types/block.js'
+import type { MemorySummary } from '../types/retrieval.js'
 import type { ConversationMessage } from '../types/conversation.js'
-import type { HeadingNode } from '../types/memory.js'
-import { MemoryStore } from './store.js'
-import { IndexEngine } from './index-engine.js'
-import { KeywordExtractor } from './keyword-extractor.js'
-import { NodeLocator, parseMarkdown } from './node-locator.js'
-import { MemoryRetriever } from './memory-retriever.js'
-import { VectorIndex } from './vector-index.js'
+import { QdrantStore } from './qdrant-store.js'
+import { DirectoryManager } from './directory-manager.js'
+import { BlockLifecycleManager } from './block-lifecycle.js'
 import { MemoryConsolidator } from './memory-consolidator.js'
-import { readFile } from './fs-adapter.js'
+import { MemoryRetriever } from './memory-retriever.js'
 
 export class FBM {
   private config: FBMConfig
-  private store!: MemoryStore
-  private indexEngine!: IndexEngine
-  private keywordExtractor!: KeywordExtractor
-  private nodeLocator!: NodeLocator
-  private vectorIndex!: VectorIndex
-  private retriever!: MemoryRetriever
+  private store!: QdrantStore
+  private directoryManager!: DirectoryManager
+  private lifecycle!: BlockLifecycleManager
   private consolidator!: MemoryConsolidator
+  private retriever!: MemoryRetriever
   private llm: LLMAdapter
   private embedding: EmbeddingAdapter | null
-  private unwatch: (() => void) | null = null
   private _initialized = false
 
   constructor(config: FBMConfig, llm: LLMAdapter, embedding?: EmbeddingAdapter) {
@@ -37,136 +31,95 @@ export class FBM {
   }
 
   async init(): Promise<void> {
-    this.store = new MemoryStore(this.config.memoryDir, this.config.store)
+    const port = this.config.qdrant?.port ?? 6333
 
-    this.indexEngine = new IndexEngine(
-      this.config.memoryDir,
-      this.config.store?.indexCacheFile
-    )
-
-    this.keywordExtractor = new KeywordExtractor(this.llm)
-    this.nodeLocator = new NodeLocator()
-
-    this.vectorIndex = new VectorIndex(
+    this.store = new QdrantStore(
+      port,
       this.embedding ?? undefined,
-      this.config.embedding?.vectorCacheFile,
-      this.config.embedding?.batchSize
-    )
-
-    this.retriever = new MemoryRetriever({
-      indexEngine: this.indexEngine,
-      keywordExtractor: this.keywordExtractor,
-      nodeLocator: this.nodeLocator,
-      vectorIndex: this.vectorIndex,
-      llm: this.llm,
-      topK: this.config.retrieval?.retrievalTopK,
-      refineResults: this.config.retrieval?.refineResults,
-    })
-
-    this.consolidator = new MemoryConsolidator(
-      this.store,
-      this.llm,
-      this.config.consolidator
+      this.config.qdrant?.memoryBlocksCollection,
+      this.config.qdrant?.memoryDirectoryCollection,
     )
 
     await this.store.init()
-    await this.indexEngine.build()
 
-    if (this.vectorIndex.enabled) {
-      await this.vectorIndex.load()
-      await this.rebuildVectors()
-    }
+    this.directoryManager = new DirectoryManager(
+      this.store,
+      this.config.retrieval?.directoryThreshold,
+    )
 
-    if (this.config.store?.watchFiles !== false) {
-      this.unwatch = this.store.watch(async (event, filePath) => {
-        if (event === 'unlink') {
-          await this.indexEngine.removeFile(filePath)
-          await this.vectorIndex.removeByFile(filePath)
-        } else if (event === 'change' || event === 'add') {
-          await this.indexEngine.updateFile(filePath)
-          if (this.vectorIndex.enabled) {
-            await this.addVectorsForFile(filePath)
-          }
-        }
-      })
-    }
+    this.lifecycle = new BlockLifecycleManager(
+      this.llm,
+      this.store,
+      this.directoryManager,
+      this.config.lifecycle?.mergeCheckInterval,
+    )
 
-    this.consolidator.onResult(async (result: ConsolidationResult) => {
-      for (const mem of result.memories) {
-        if (mem.filePath) {
-          await this.indexEngine.indexFile(mem.filePath)
-          if (this.vectorIndex.enabled) {
-            await this.addVectorsForFile(mem.filePath)
-          }
-        }
-      }
-    })
+    this.consolidator = new MemoryConsolidator(
+      this.llm,
+      this.store,
+      this.directoryManager,
+    )
+
+    this.retriever = new MemoryRetriever(
+      this.llm,
+      this.store,
+      this.directoryManager,
+      this.lifecycle,
+      {
+        topK: this.config.retrieval?.retrievalTopK,
+        minScore: this.config.retrieval?.minScore,
+        refineResults: this.config.retrieval?.refineResults,
+      },
+    )
 
     this._initialized = true
   }
 
   async retrieve(query: string | string[]): Promise<MemorySummary> {
     this.ensureInitialized()
-    return this.retriever.retrieveAndSummarize(query)
+    const queryStr = Array.isArray(query) ? query.join(' ') : query
+    return this.retriever.retrieve(queryStr)
   }
 
   async consolidate(messages: ConversationMessage[]): Promise<ConsolidationResult> {
     this.ensureInitialized()
-    return this.consolidator.consolidate(messages)
+    const result = await this.consolidator.consolidate(messages)
+    this.lifecycle.onConsolidationComplete()
+    return result
   }
 
-  async writeMemory(title: string, content: string, targetFile?: string): Promise<string> {
-    this.ensureInitialized()
-    if (targetFile) {
-      return this.store.appendToFile(targetFile, title, content)
-    }
-    return this.store.createFile(title, title, content)
-  }
-
-  getStore(): MemoryStore {
+  getStore(): QdrantStore {
     this.ensureInitialized()
     return this.store
   }
 
-  getIndexEngine(): IndexEngine {
+  getDirectoryManager(): DirectoryManager {
     this.ensureInitialized()
-    return this.indexEngine
+    return this.directoryManager
   }
 
-  getVectorIndex(): VectorIndex {
+  getLifecycle(): BlockLifecycleManager {
     this.ensureInitialized()
-    return this.vectorIndex
+    return this.lifecycle
   }
 
-  getConsolidator(): MemoryConsolidator {
+  async getStats(): Promise<{ blockPoints: number; directoryEntries: number; uniqueBlocks: number }> {
     this.ensureInitialized()
-    return this.consolidator
+    return this.store.getStats()
   }
 
   async reindexVectors(): Promise<number> {
     this.ensureInitialized()
-    if (!this.vectorIndex.enabled) return 0
-    await this.vectorIndex.clear()
-    await this.addVectorsForDir(this.config.memoryDir)
-    return this.vectorIndex.size
-  }
-
-  async reindexFile(filePath: string): Promise<number> {
-    this.ensureInitialized()
-    if (!this.vectorIndex.enabled) return 0
-    await this.vectorIndex.removeByFile(filePath)
-    await this.addVectorsForFile(filePath)
-    return this.vectorIndex.size
+    const stats = await this.store.getStats()
+    return stats.blockPoints
   }
 
   async clearVectors(): Promise<void> {
     this.ensureInitialized()
-    await this.vectorIndex.clear()
+    await this.store.clearAll()
   }
 
   async shutdown(): Promise<void> {
-    this.consolidator.destroy()
-    this.unwatch?.()
     this._initialized = false
   }
 
@@ -176,17 +129,7 @@ export class FBM {
       await this.shutdown()
     }
 
-    const memoryDir = `${baseDir}/memories`
-    this.config.memoryDir = memoryDir
-    this.config.store = {
-      ...this.config.store,
-      indexCacheFile: `${memoryDir}/.index-cache.json`,
-    }
-    this.config.embedding = {
-      ...this.config.embedding,
-      vectorCacheFile: `${memoryDir}/.vector-meta.json`,
-    }
-
+    this.config.memoryDir = `${baseDir}/memories`
     await this.init()
   }
 
@@ -195,66 +138,4 @@ export class FBM {
       throw new Error('FBM is not initialized. Call init() first.')
     }
   }
-
-  private async rebuildVectors(): Promise<void> {
-    if (!this.vectorIndex.enabled) {
-      console.log('[FBM] Vector index disabled (no embedding adapter)')
-      return
-    }
-    if (this.vectorIndex.size > 0) {
-      console.log('[FBM] Vector index already has', this.vectorIndex.size, 'entries, skipping rebuild')
-      return
-    }
-    console.log('[FBM] Rebuilding vectors...')
-    await this.addVectorsForDir(this.config.memoryDir)
-    console.log('[FBM] Vector rebuild complete, entries:', this.vectorIndex.size)
-  }
-
-  private async addVectorsForDir(dir: string): Promise<void> {
-    const files = await this.nodeLocator.searchFiles(dir)
-    for (const filePath of files) {
-      await this.addVectorsForFile(filePath)
-    }
-  }
-
-  private async addVectorsForFile(filePath: string): Promise<void> {
-    if (!this.embedding) return
-    try {
-      const content = await readFile(filePath, 'utf-8')
-      const headings = parseMarkdown(content, filePath)
-
-      const flat = this.flattenHeadings(headings, [])
-      const items = flat.map(({ node, path }) => ({
-        ref: {
-          filePath,
-          headingPath: path,
-          lineStart: node.lineStart,
-          lineEnd: node.lineEnd,
-          title: node.title,
-          sectionId: node.sectionId,
-        },
-        content: `${node.title}\n${this.nodeLocator.extractContent(node)}`,
-      }))
-
-      if (items.length > 0) {
-        await this.vectorIndex.addEntriesIncremental(items)
-      }
-    } catch (err) {
-      console.warn('[FBM] addVectorsForFile failed for', filePath, err)
-    }
-  }
-
-  private flattenHeadings(nodes: HeadingNode[], parentPath: string[]): Array<{ node: HeadingNode; path: string[] }> {
-    const result: Array<{ node: HeadingNode; path: string[] }> = []
-    for (const node of nodes) {
-      const path = [...parentPath, node.title]
-      result.push({ node, path })
-      const childHeadings = node.children.filter(
-        (n): n is HeadingNode => n.type === 'heading'
-      )
-      result.push(...this.flattenHeadings(childHeadings, path))
-    }
-    return result
-  }
-
 }

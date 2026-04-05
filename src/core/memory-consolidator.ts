@@ -1,308 +1,341 @@
 import type { ConversationMessage } from '../types/conversation.js'
-import type { MemoryDocument, ConsolidationResult, MemoryRoute } from '../types/retrieval.js'
 import type { LLMAdapter, LLMMessage } from '../types/adapter.js'
-import type { ConsolidatorConfig } from '../types/config.js'
-import { MemoryStore } from './store.js'
-import { normalizeTitle } from './node-locator.js'
+import type { SegmentationResult, BlockOperation, ConsolidationResult } from '../types/block.js'
+import type { QdrantStore } from './qdrant-store.js'
+import type { DirectoryManager } from './directory-manager.js'
 
-function parseYamlMemoryItems(text: string): MemoryRoute[] {
-  const trimmed = text.trim()
-  if (!trimmed.startsWith('- ')) return []
-
-  const items: MemoryRoute[] = []
-  let currentItem: Record<string, string> | null = null
-  let currentKey = ''
-  let valueLines: string[] = []
-
-  const flushItem = () => {
-    if (currentKey && currentItem) {
-      currentItem[currentKey] = valueLines.join('\n').trim()
-    }
-    if (currentItem && currentItem.file && currentItem.title) {
-      items.push({
-        file: currentItem.file,
-        title: currentItem.title,
-        content: currentItem.content || '',
-        action: (currentItem.action as MemoryRoute['action']) || 'append',
-      })
-    }
-    currentItem = null
-    currentKey = ''
-    valueLines = []
-  }
-
-  for (const rawLine of trimmed.split('\n')) {
-    const itemStart = rawLine.match(/^- (file|title|content|action):\s*(.*)/)
-    if (itemStart) {
-      flushItem()
-      currentItem = {}
-      currentKey = itemStart[1]
-      valueLines = itemStart[2] ? [itemStart[2]] : []
-      continue
-    }
-
-    const kvMatch = rawLine.match(/^\s{1,2}(file|title|content|action):\s*(.*)/)
-    if (kvMatch && currentItem) {
-      if (currentKey) {
-        currentItem[currentKey] = valueLines.join('\n').trim()
-      }
-      currentKey = kvMatch[1]
-      valueLines = kvMatch[2] ? [kvMatch[2]] : []
-      continue
-    }
-
-    if (currentKey && currentItem) {
-      valueLines.push(rawLine.replace(/^\s{2,}/, ''))
-    }
-  }
-  flushItem()
-
-  return items
+function generateBlockId(): string {
+  const ts = Date.now().toString(36)
+  const rand = Math.random().toString(36).slice(2, 8)
+  return `blk_${ts}_${rand}`
 }
 
-function isValidMemoryRoute(obj: unknown): obj is MemoryRoute {
-  if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return false
-  const r = obj as Record<string, unknown>
-  return typeof r.file === 'string' && typeof r.title === 'string' && typeof r.content === 'string'
-}
+const TOPIC_SEGMENTATION_PROMPT = `你是一个对话分析助手。你的任务是分析一段对话，判断其中是否包含多个不相关的话题。
 
-function tryParseStringItems(arr: unknown[]): unknown[] {
-  return arr.map(item => {
-    if (typeof item === 'string') {
-      try { return JSON.parse(item) } catch { return item }
+## 不相关的定义
+两个话题"不相关"指的是：用户在未来某次对话中，几乎不可能在同一条消息中同时提到这两个话题的关键词。
+
+## 判断示例
+
+✅ 需要拆分（完全不相关）：
+- "Vue迁移React的技术讨论" 和 "周末看电影" → 技术和娱乐完全无关
+- "用户的工作经历" 和 "用户的宠物名字" → 职业和宠物无关
+- "编程问题" 和 "旅行计划" → 工作和休闲无关
+
+❌ 不需要拆分（有内在关联）：
+- "React组件设计" 和 "React状态管理" → 同属React技术栈
+- "用户自我介绍" 和 "用户提到家人" → 同属个人信息
+- "项目架构讨论" 和 "项目部署方案" → 同一项目的不同方面
+- "讨论Rust" 和 "讨论Rust的所有权系统" → 同一话题的深入
+
+## 注意
+- 礼貌用语（"谢谢"、"好的"、"嗯"）不构成独立话题，忽略它们
+- 短暂的过渡句（"对了"、"换个话题"）是话题切换的信号，不是话题本身
+- 如果整段对话围绕一个大话题的不同方面，视为一个话题组
+
+## 输出格式
+输出JSON，严格遵循以下结构：
+{
+  "segments": [
+    {
+      "messageIndices": [0, 1, 2, 3],
+      "topicHint": "一句话描述这组消息的核心话题"
     }
-    return item
-  })
+  ]
 }
 
-function extractAndParseJSON(text: string): unknown[] {
-  const trimmed = text.trim()
+messageIndices 是消息在输入列表中的索引（从0开始）。
+如果所有消息属于同一个话题，segments 只有一个元素，messageIndices 包含全部索引。
+只输出JSON，不要输出任何其他内容。`
 
-  const arrayMatch = trimmed.match(/\[[\s\S]*\]/)
-  if (arrayMatch) {
-    try {
-      const parsed = JSON.parse(arrayMatch[0])
-      if (Array.isArray(parsed)) return tryParseStringItems(parsed)
-    } catch {}
-  }
+const CONSOLIDATION_PROMPT = `你是一个记忆整合助手。你将收到一组属于同一话题的对话消息，以及当前的记忆目录结构。你的任务是将对话中的有价值信息整合为记忆区块。
 
-  const objectMatches = trimmed.match(/\{[\s\S]*?"action"\s*:\s*"[^"]*"[\s\S]*\}/g)
-  if (objectMatches) {
-    const results: unknown[] = []
-    for (const m of objectMatches) {
-      try {
-        results.push(JSON.parse(m))
-      } catch {}
+## 现有记忆目录
+{directoryTree}
+
+## 已有区块详情（可能与本次对话相关的区块）
+{relatedBlocks}
+
+## 整合规则
+
+### 1. 判断动作
+- "create"：这是一个全新的话题，现有目录中没有相关区块。创建新的记忆区块。
+- "update"：现有目录中已有相关区块，本次对话提供了新的或更新的信息。更新该区块。
+- "ignore"：这段对话没有值得长期记住的信息（闲聊、问候、重复信息）。
+
+### 2. 目录分类
+将记忆归入合适的分类路径。优先使用现有分类，只在确实不匹配时创建新分类。
+路径格式：大类/子类
+例如：技术经验/React相关、用户信息/基本信息
+
+分类原则：
+- 每个大类下的子类控制在10个以内
+- 目录路径最多2层（大类/子类），具体条目是第3层由directoryEntry字段体现
+- 同类信息必须归入同一个大类
+
+### 3. 关键词句设计（最重要的部分）
+你需要输出5-10个关键词句，这些词句将被向量化用于后续的记忆召回匹配。
+
+关键词句设计原则：
+- 站在"用户未来会怎么问"的角度来设计
+- 全面拆解表层语义、深层意图、关联历史维度、上下文相关方向，穷尽所有可被用于检索关联点，不要泛泛的词
+- 每个关键词句应该是一个完整的短语或短句，能独立表达一个信息点
+- 覆盖不同的表述角度
+- 避免使用只在当前对话中出现的临时表述
+
+好的关键词句示例：
+- "从Vue迁移到React花了两个月"
+- "Redux和Vuex状态管理思路差异"
+- "React函数组件比类组件更受用户偏好"
+
+差的关键词句示例：
+- "迁移"（太泛）
+- "用户说React"（没有信息量）
+- "上面讨论的前端框架"（依赖上下文，脱离对话后无意义）
+
+### 4. 摘要质量
+summary应该：
+- 结构化呈现，保留所有有价值的事实细节（时间、数量、名称、结论等）
+- 自包含，不需要原始对话即可理解
+- 不丢失任何可能在未来有用的信息
+- 用列表、小标题等格式组织，方便快速浏览
+
+### 5. 重要度评定
+为每个记忆区块评定重要度：
+- "critical"：用户的核心身份信息（姓名、基本性格、核心价值观、关键人际关系等）
+- "high"：重要的长期知识（工作技能、重要经历、长期偏好、重大决策）
+- "normal"：普通信息（项目细节、临时讨论、一般性经验）
+- "low"：低价值信息（日常闲聊中的非关键细节、已知的重复信息）
+
+评定原则：
+- 宁可偏高不要偏低，信息丢失比信息冗余代价更大
+- 用户主动分享的个人信息通常至少是"high"
+- 任何涉及用户身份认同的信息至少是"high"
+- 纯技术讨论的细节通常是"normal"
+- 临时性的、过程性的信息可以是"low"
+
+## 输出格式
+输出JSON数组，每个元素代表一个记忆区块的操作：
+[
+  {
+    "action": "create" | "update" | "ignore",
+    "targetBlockId": "现有区块的blockId（仅action为update时需要）",
+    "updateStrategy": "incremental" | "replace"（仅action为update时需要）",
+    "block": {
+      "directoryEntry": "一句话总结，用作目录条目",
+      "category": "大类名称",
+      "subCategory": "子类名称",
+      "keywords": [
+        "关键词句1",
+        "关键词句2",
+        "关键词句3"
+      ],
+      "summary": "结构化的记忆总结，保留所有事实细节",
+      "importance": "critical" | "high" | "normal" | "low"
     }
-    if (results.length > 0) return results
   }
+]
 
-  try {
-    const parsed = JSON.parse(trimmed)
-    if (Array.isArray(parsed)) return tryParseStringItems(parsed)
-    if (typeof parsed === 'object' && parsed !== null) return [parsed]
-  } catch {}
-
-  return []
-}
-
-function parseLLMResponse(content: string): MemoryRoute[] {
-  const trimmed = content.trim()
-
-  const jsonItems = extractAndParseJSON(trimmed)
-  if (jsonItems.length > 0) {
-    const valid = jsonItems.filter(isValidMemoryRoute)
-    if (valid.length > 0) {
-      if (valid.length < jsonItems.length) {
-        console.warn(
-          `[FBM] parseLLMResponse: ${jsonItems.length - valid.length} items discarded due to invalid structure`,
-          'raw sample:', JSON.stringify(jsonItems.find(i => !isValidMemoryRoute(i)))
-        )
-      }
-      return valid
-    }
-    console.warn('[FBM] parseLLMResponse: JSON parsed but no valid MemoryRoute items found')
-  }
-
-  const yamlItems = parseYamlMemoryItems(trimmed)
-  if (yamlItems.length > 0) return yamlItems
-
-  console.warn('[FBM] parseLLMResponse: failed to parse LLM response', trimmed.slice(0, 200))
-  return []
-}
-
-const CONSOLIDATION_PROMPT = `You are a memory consolidation assistant. Analyze the conversation and extract information worth remembering long-term.
-
-You will receive a list of existing memory files with their section headings and content summaries. For each piece of valuable information, decide which action to take:
-
-Actions:
-- "append": Add a NEW section to an existing file, or create a new file if the file doesn't exist yet. ONLY use this for topics that do NOT already have a matching section in any existing file.
-- "update": Replace the content of an existing section with updated information. MUST use this when a section with a SIMILAR topic already exists — even if the information is partially new. Merge new information into the existing section rather than creating a duplicate.
-- "delete": Remove an existing section that is no longer relevant or accurate.
-
-Output a JSON array of objects with:
-- "file": the target file name (without .md extension). MUST use an existing file name if the information is related to any existing section in that file.
-- "title": the section heading title. For "update"/"delete", must match the EXACT existing heading title. For "append", use a clear, distinct title that does NOT overlap with any existing section.
-- "content": the extracted information as structured markdown (ignored for delete action). For "update", provide ONLY the new or changed information — the system will automatically merge it with existing content.
-- "action": one of "append", "update", "delete"
-
-CRITICAL RULES (must follow strictly):
-- NEVER create a new section if a similar topic already exists in the same file — use "update" instead with the EXACT existing heading.
-- NEVER output two sections with similar topics in the same consolidation batch — merge them into one "update".
-- Extract factual knowledge, lessons learned, user preferences, important decisions.
-- Skip trivial small talk, greetings, acknowledgments, and information that is already accurately captured in existing sections.
-- Content should be self-contained and understandable without the original conversation.
-- File names should be concise and descriptive (e.g. "用户信息", "项目开发记录").
-- Output ONLY a JSON array, nothing else.`
+只输出JSON数组，不要输出任何其他内容。`
 
 export class MemoryConsolidator {
-  private store: MemoryStore
   private llm: LLMAdapter
-  private config: ConsolidatorConfig
-  private onConsolidated: ((result: ConsolidationResult) => void) | null = null
+  private store: QdrantStore
+  private directoryManager: DirectoryManager
 
-  constructor(store: MemoryStore, llm: LLMAdapter, config: ConsolidatorConfig = {}) {
-    this.store = store
+  constructor(llm: LLMAdapter, store: QdrantStore, directoryManager: DirectoryManager) {
     this.llm = llm
-    this.config = config
-  }
-
-  onResult(callback: (result: ConsolidationResult) => void): void {
-    this.onConsolidated = callback
+    this.store = store
+    this.directoryManager = directoryManager
   }
 
   async consolidate(messages: ConversationMessage[]): Promise<ConsolidationResult> {
     if (messages.length === 0) {
-      return { memories: [], created: 0, updated: 0, deleted: 0, skipped: 0 }
+      return { created: 0, updated: 0, deleted: 0, skipped: 0 }
     }
 
-    let existingFiles: Array<{ fileName: string; sections: Array<{ heading: string; summary: string }> }>
+    console.log(`[Consolidator] Starting consolidation with ${messages.length} messages`)
+
+    const segmentation = await this.segmentTopics(messages)
+    console.log(`[Consolidator] Segmented into ${segmentation.segments.length} segments`)
+
+    let created = 0
+    let updated = 0
+    let skipped = 0
+
+    for (const segment of segmentation.segments) {
+      const segmentMessages = segment.messageIndices
+        .filter(i => i < messages.length)
+        .map(i => messages[i])
+
+      if (segmentMessages.length === 0) continue
+
+      const operations = await this.integrateSegment(segmentMessages)
+      console.log(`[Consolidator] Segment "${segment.topicHint}": ${operations.length} operations:`, operations.map(o => o.action))
+
+      for (const op of operations) {
+        if (op.action === 'ignore') {
+          skipped++
+          continue
+        }
+
+        try {
+          if (op.action === 'create' && op.block) {
+            const blockId = generateBlockId()
+            await this.writeBlock(blockId, op.block, segmentMessages)
+            created++
+            console.log(`[Consolidator] Created block ${blockId}: "${op.block.directoryEntry}"`)
+          } else if (op.action === 'update' && op.block && op.targetBlockId) {
+            await this.updateBlock(op.targetBlockId, op.block, op.updateStrategy ?? 'incremental', segmentMessages)
+            updated++
+            console.log(`[Consolidator] Updated block ${op.targetBlockId}: "${op.block.directoryEntry}"`)
+          } else {
+            console.warn('[Consolidator] Invalid operation:', op)
+            skipped++
+          }
+        } catch (err) {
+          console.warn(`[Consolidator] Failed to ${op.action} block:`, err)
+          skipped++
+        }
+      }
+    }
+
+    console.log(`[Consolidator] Done: created=${created}, updated=${updated}, skipped=${skipped}`)
+    return { created, updated, deleted: 0, skipped }
+  }
+
+  private async segmentTopics(messages: ConversationMessage[]): Promise<SegmentationResult> {
+    const conversationText = messages
+      .map((m, i) => `[${i}] [${m.role}]: ${m.content}`)
+      .join('\n')
+
+    const llmMessages: LLMMessage[] = [
+      { role: 'system', content: TOPIC_SEGMENTATION_PROMPT },
+      { role: 'user', content: conversationText },
+    ]
+
+    const response = await this.llm.chat(llmMessages, { temperature: 0.3 })
+    console.log(`[Consolidator] Segmentation response (first 300 chars): ${response.content.slice(0, 300)}`)
+    return this.parseSegmentation(response.content)
+  }
+
+  private parseSegmentation(content: string): SegmentationResult {
+    const trimmed = content.trim()
+    const jsonMatch = trimmed.match(/\{[\s\S]*\}/)
+    if (!jsonMatch) {
+      return { segments: [{ messageIndices: [0], topicHint: 'default' }] }
+    }
+
     try {
-      existingFiles = await this.store.getMemoryFiles()
+      const parsed = JSON.parse(jsonMatch[0])
+      if (parsed.segments && Array.isArray(parsed.segments)) {
+        return parsed as SegmentationResult
+      }
     } catch {
-      existingFiles = []
+      // fall through
     }
 
-    const fileListSection = existingFiles.length > 0
-      ? `\n\nExisting memory files and sections:\n${existingFiles.map(f =>
-          `- ${f.fileName.replace(/\.md$/, '')}:\n${f.sections.map(s => `    - ${s.heading}: ${s.summary}`).join('\n')}`
-        ).join('\n')}`
-      : '\n\nNo existing memory files.'
+    return { segments: [{ messageIndices: [0], topicHint: 'default' }] }
+  }
+
+  private async integrateSegment(messages: ConversationMessage[]): Promise<BlockOperation[]> {
+    const directoryTree = await this.directoryManager.buildDirectoryTreeText()
+    const relatedBlocks = ''
 
     const conversationText = messages
       .map(m => `[${m.role}]: ${m.content}`)
       .join('\n')
 
+    const prompt = CONSOLIDATION_PROMPT
+      .replace('{directoryTree}', directoryTree)
+      .replace('{relatedBlocks}', relatedBlocks)
+
     const llmMessages: LLMMessage[] = [
-      { role: 'system', content: CONSOLIDATION_PROMPT + fileListSection },
+      { role: 'system', content: prompt },
       { role: 'user', content: conversationText },
     ]
 
-    let rawMemories: MemoryRoute[]
-    try {
-      const response = await this.llm.chat(llmMessages, {
-        maxTokens: this.config.maxSummaryTokens,
-        temperature: 0.3,
-      })
-      rawMemories = parseLLMResponse(response.content)
-      if (rawMemories.length === 0) {
-        return { memories: [], created: 0, updated: 0, deleted: 0, skipped: 0 }
-      }
-    } catch (err) {
-      console.warn('[FBM] consolidation LLM call failed:', err)
-      return { memories: [], created: 0, updated: 0, deleted: 0, skipped: 0 }
-    }
-
-    const result: ConsolidationResult = { memories: [], created: 0, updated: 0, deleted: 0, skipped: 0 }
-
-    const processedSections = new Map<string, Set<string>>()
-
-    const fileHasSection = (fileName: string, title: string): boolean => {
-      const normalized = normalizeTitle(title)
-      const existing = existingFiles.find(f => f.fileName.replace(/\.md$/, '') === fileName)
-      if (existing) {
-        if (existing.sections.some(s => normalizeTitle(s.heading) === normalized)) return true
-      }
-      const tracked = processedSections.get(fileName)
-      if (tracked) {
-        for (const t of tracked) {
-          if (normalizeTitle(t) === normalized) return true
-        }
-      }
-      return false
-    }
-
-    const trackSection = (fileName: string, title: string): void => {
-      if (!processedSections.has(fileName)) {
-        processedSections.set(fileName, new Set())
-      }
-      processedSections.get(fileName)!.add(title)
-    }
-
-    for (const raw of rawMemories) {
-      try {
-        const action = raw.action || 'append'
-        const existingFile = existingFiles.find(
-          f => f.fileName.replace(/\.md$/, '') === raw.file
-        )
-
-        let filePath: string
-        if (action === 'delete') {
-          if (existingFile) {
-            filePath = await this.store.deleteSection(raw.file, raw.title)
-            result.deleted++
-          } else {
-            result.skipped++
-            continue
-          }
-        } else if (action === 'update') {
-          if (existingFile || fileHasSection(raw.file, raw.title)) {
-            filePath = await this.store.updateSection(raw.file, raw.title, raw.content)
-            trackSection(raw.file, raw.title)
-          } else {
-            filePath = await this.store.createFile(raw.file, raw.title, raw.content)
-            trackSection(raw.file, raw.title)
-            result.created++
-          }
-          result.updated++
-        } else {
-          if (existingFile || fileHasSection(raw.file, raw.title)) {
-            if (fileHasSection(raw.file, raw.title)) {
-              filePath = await this.store.updateSection(raw.file, raw.title, raw.content)
-              result.updated++
-            } else {
-              filePath = await this.store.appendToFile(raw.file, raw.title, raw.content)
-              trackSection(raw.file, raw.title)
-              result.created++
-            }
-          } else {
-            filePath = await this.store.createFile(raw.file, raw.title, raw.content)
-            trackSection(raw.file, raw.title)
-            result.created++
-          }
-        }
-
-        const doc: MemoryDocument = {
-          title: raw.title,
-          content: raw.content,
-          filePath,
-          fileName: `${raw.file}.md`,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-        }
-
-        result.memories.push(doc)
-      } catch (err) {
-        console.warn(`[FBM] failed to process memory item (file="${raw.file}", title="${raw.title}"):`, err)
-        result.skipped++
-      }
-    }
-
-    await this.onConsolidated?.(result)
-    return result
+    const response = await this.llm.chat(llmMessages, { temperature: 0.3 })
+    console.log(`[Consolidator] LLM response for integration (first 500 chars): ${response.content.slice(0, 500)}`)
+    return this.parseOperations(response.content)
   }
 
-  destroy(): void {
-    // no-op: no timers or buffers to clean up
+  private parseOperations(content: string): BlockOperation[] {
+    const trimmed = content.trim()
+    const jsonMatch = trimmed.match(/\[[\s\S]*\]/)
+    if (!jsonMatch) return [{ action: 'ignore' }]
+
+    try {
+      const parsed = JSON.parse(jsonMatch[0])
+      if (Array.isArray(parsed)) {
+        return parsed.filter(op =>
+          typeof op === 'object' && op !== null && typeof op.action === 'string'
+        )
+      }
+    } catch {
+      // fall through
+    }
+
+    return [{ action: 'ignore' }]
+  }
+
+  private async writeBlock(
+    blockId: string,
+    block: NonNullable<BlockOperation['block']>,
+    messages: ConversationMessage[],
+  ): Promise<void> {
+    const rawContent = messages.map(m => `[${m.role}]: ${m.content}`).join('\n')
+    const conversationId = messages[0]?.timestamp?.toString()
+
+    await this.store.writeRawContext(
+      blockId, rawContent,
+      block.directoryEntry, block.category, block.subCategory,
+      block.summary, block.importance, conversationId,
+    )
+
+    await this.store.writeKeywordAnchors(
+      blockId, block.keywords,
+      block.directoryEntry, block.category, block.subCategory,
+      block.summary, block.importance,
+    )
+
+    await this.store.writeDirectoryEntry(
+      blockId, block.directoryEntry,
+      block.category, block.subCategory,
+      block.summary, block.keywords, block.importance,
+      1 + block.keywords.length,
+    )
+  }
+
+  private async updateBlock(
+    blockId: string,
+    block: NonNullable<BlockOperation['block']>,
+    strategy: 'incremental' | 'replace',
+    messages: ConversationMessage[],
+  ): Promise<void> {
+    const rawContent = messages.map(m => `[${m.role}]: ${m.content}`).join('\n')
+
+    if (strategy === 'replace') {
+      await this.store.deleteBlock(blockId)
+    }
+
+    await this.store.writeRawContext(
+      blockId, rawContent,
+      block.directoryEntry, block.category, block.subCategory,
+      block.summary, block.importance,
+    )
+
+    await this.store.writeKeywordAnchors(
+      blockId, block.keywords,
+      block.directoryEntry, block.category, block.subCategory,
+      block.summary, block.importance,
+    )
+
+    await this.store.writeDirectoryEntry(
+      blockId, block.directoryEntry,
+      block.category, block.subCategory,
+      block.summary, block.keywords, block.importance,
+      1 + block.keywords.length,
+    )
   }
 }
