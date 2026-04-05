@@ -1,61 +1,77 @@
 # FBM - Fairy Bionic Memory
 
-> 仿生记忆系统，为 AI Agent 提供持久化、可检索、自动整理的记忆能力。
+> 仿生记忆系统，为 AI Agent 提供持久化、可检索、自动整理的区块记忆能力。
 
 ## 理念
 
 AI Agent 在多轮对话中面临"记忆断层"——上下文窗口有限，历史对话和知识无法持久化检索。FBM 模拟人类记忆的工作方式：
 
 - **按需检索** — 宿主封装为工具，主模型按需调用，不阻塞普通对话
-- **长期记忆** — 对话总结为结构化文档，相关记忆聚合到同一文件
-- **双路检索** — 关键词匹配 + 向量语义检索，结果合并去重
-- **精确定位** — Markdown 文档的标题级精确定位与全文提取
+- **区块记忆** — 对话被分割为结构化记忆区块（Block），按话题组织
+- **分层目录** — 记忆通过 Category → SubCategory → Block 的目录树管理
+- **三阶段检索** — 目录筛选 → dense+BM25 混合检索 → LLM 精炼
+- **生命周期** — 记忆拥有重要度分级、访问追踪、过期淘汰与自动合并
 
 ## 特性
 
-- **零外部依赖** — 不依赖向量数据库、SQLite 等，纯文件系统存储 + 内存索引
-- **完全解耦** — 独立 TypeScript 库，不依赖任何宿主应用内部模块
+- **区块化记忆** — 对话按话题分割为独立区块，每个区块包含原始上下文和关键词锚点
+- **分层目录** — Category → SubCategory → Entry 三级目录，LLM 智能分类
+- **双向量策略** — Dense 向量（语义）+ BM25 稀疏向量（关键词），RRF 融合排序
+- **三阶段检索** — 目录筛选 → 混合向量检索 → LLM 精炼，层层过滤精准定位
+- **生命周期管理** — 重要度分级（critical/high/normal/low）、过期检查、自动合并
+- **访问追踪** — 记录访问频率，高频区块自动升级重要度
+- **完全解耦** — 独立 TypeScript 库，通过适配器注入 LLM 和 Embedding
 - **被动式设计** — FBM 不持有对话状态，所有操作由宿主按需调用
-- **双路检索** — 关键词匹配 + 向量语义检索，结果合并去重
-- **可配置精炼** — 检索结果可选副模型精炼或直接返回原始片段
-- **跨层级定位** — Markdown 文档的标题级精确定位与全文提取
-- **文件聚合** — 相关记忆自动聚合到同一文件，由 AI 决定文件名和分类
-- **向量回溯** — 向量匹配命中后可精确定位到原始文档
 - **优雅降级** — Embedding 未配置时自动降级为纯关键词模式
-- **文件监听** — 外部修改记忆文件时自动热更新索引
 
 ## 架构
 
 ```
 FBM Core
-├── MemoryStore          记忆持久化（文件读写、变更监听、文件聚合）
-├── IndexEngine          关键词倒排索引（标题树、增量更新、持久化缓存）
-├── VectorIndex          向量索引（Embedding、余弦相似度、原文回溯）
-├── KeywordExtractor     关键词提取（副模型 + 本地 TF-IDF 回退）
-├── NodeLocator          节点定位（Markdown 解析、跨目录标题/代码块定位）
-├── MemoryRetriever      记忆检索器（双路检索 → 合并 → 定位 → 精炼）
-└── MemoryConsolidator   记忆总结（从对话中提取记忆、路由到目标文件）
+├── QdrantStore            向量存储（Dense + BM25 稀疏向量、RRF 融合检索）
+├── DirectoryManager       目录管理（分类/子类/条目、智能展示格式切换）
+├── BlockLifecycleManager  生命周期（过期检查、自动合并、访问追踪与升级）
+├── KeywordExtractor       关键词提取（LLM 提取 + 本地 TF-IDF 回退）
+├── MemoryConsolidator     记忆整合（话题分割 → LLM 整合决策 → 写入向量）
+└── MemoryRetriever        记忆检索（目录筛选 → 混合检索 → LLM 精炼）
 ```
 
-### 记忆存储结构
+### 区块数据模型
+
+每个记忆区块（Block）在 Qdrant 中存储为多个向量点：
+
+| 点类型 | 说明 | 向量 |
+|--------|------|------|
+| `raw_context` | 原始对话上下文（每区块 1 个） | Dense |
+| `keyword_anchor` | 面向检索的关键词句（每区块 N 个） | Dense + BM25 |
+
+同时维护一个 `memory_directory` 集合，存储所有区块的目录索引。
+
+### 目录结构
 
 ```
-memories/
-├── 用户信息.md              ← AI 自主命名，包含多个章节
-│   ├── # 基本信息
-│   ├── # 技术背景
-│   └── # 个人偏好
-├── AuroraFairy项目开发.md
-│   ├── # 架构设计
-│   ├── # Tauri借用检查器陷阱
-│   └── # FBM集成经验
-├── 日常对话备忘.md
+Category (大类)
+├── SubCategory (子类)
+│   ├── Block Entry (目录条目)
+│   │   ├── blockId
+│   │   ├── summary
+│   │   ├── keywordAnchors
+│   │   └── importance
+│   └── ...
 └── ...
 ```
 
-相关记忆聚合到同一文件，文件名和章节组织由 AI 在总结时决定。每个文件内以 Markdown 标题（`#`、`##`）作为章节分隔。
+分类和子类由 LLM 在记忆整合时自动决定，无需预先定义。
 
 ## 快速开始
+
+### 前置条件
+
+FBM 使用 [Qdrant](https://qdrant.tech/) 作为向量数据库。启动 Qdrant：
+
+```bash
+docker run -p 6333:6333 qdrant/qdrant
+```
 
 ### 安装
 
@@ -83,21 +99,20 @@ const embedding = new OpenAIEmbeddingAdapter({
 const fbm = new FBM(
   {
     memoryDir: './memories',
+    qdrant: {
+      port: 6333,
+    },
     retrieval: {
-      refineResults: true,     // 副模型精炼检索结果（false 则返回原始片段）
+      refineResults: true,
       retrievalTopK: 10,
-      minScore: 0.5,
+      minScore: 0.3,
     },
-    consolidator: {
-      maxSummaryTokens: 2000,
-    },
-    store: {
-      watchFiles: true,
-      indexCacheFile: './memories/.index-cache.json',
+    lifecycle: {
+      enableExpiration: true,
+      mergeCheckInterval: 10,
     },
     embedding: {
       batchSize: 20,
-      vectorCacheFile: './memories/.vector-cache.json',
     },
   },
   llm,
@@ -106,38 +121,24 @@ const fbm = new FBM(
 
 await fbm.init()
 
-// 检索记忆（工具模式，由宿主封装为 memory_search 工具供主模型调用）
+// 检索记忆
 const result = await fbm.retrieve('如何解决 Tauri 中的借用检查器问题？')
-console.log(result.summary)       // 精炼后的记忆内容
-console.log(result.results)       // 原始检索结果列表
+console.log(result.summary)
+console.log(result.results)
 
-// 总结对话（宿主在合适的时机调用，如对话结束、话题切换等）
+// 总结对话
 const summary = await fbm.consolidate([
   { role: 'user', content: '我的名字是 cucu，今年 28 岁', timestamp: Date.now() },
   { role: 'assistant', content: '你好 cucu！很高兴认识你。', timestamp: Date.now() },
 ])
-console.log(`${summary.created} 条新记忆已存储`)
+console.log(`创建 ${summary.created} 条，更新 ${summary.updated} 条，跳过 ${summary.skipped} 条`)
 
-// 单条写入记忆
-await fbm.writeMemory('会议纪要', '2024-01-15 项目启动会议...', '项目记录')
+// 查看统计
+const stats = await fbm.getStats()
+console.log(`区块点: ${stats.blockPoints}, 目录条目: ${stats.directoryEntries}`)
 
-// 关闭时释放资源
+// 关闭
 await fbm.shutdown()
-```
-
-### 仅关键词模式（无需 Embedding）
-
-```typescript
-const llm = new OpenAILLMAdapter({ baseUrl: '...', apiKey: '...', model: '...' })
-
-const fbm = new FBM(
-  {
-    memoryDir: './memories',
-    retrieval: { refineResults: true, retrievalTopK: 5, minScore: 0.3 },
-  },
-  llm,
-  // 不传 embedding 参数，向量检索自动禁用
-)
 ```
 
 ### 自定义适配器
@@ -153,7 +154,7 @@ const customLLM: LLMAdapter = {
 
 const customEmbedding: EmbeddingAdapter = {
   async embed(texts) {
-    return { embeddings: [[0.1, 0.2, ...]] }
+    return { embeddings: [[0.1, 0.2, /* ... */]] }
   },
   getDimension() { return 1536 },
 }
@@ -174,92 +175,126 @@ const embedding = new OpenAIEmbeddingAdapter({
 })
 ```
 
-**连接 vLLM / TEI 自部署：**
-
-```typescript
-const llm = new OpenAILLMAdapter({
-  baseUrl: 'http://your-server:8000', apiKey: 'token-xxx', model: 'your-model',
-})
-```
-
-### 向量化管理
-
-```typescript
-// 全量重建 —— 比如更换了 Embedding 模型后
-const count = await fbm.reindexVectors()
-console.log(`重建完成，共 ${count} 条向量`)
-
-// 单文件更新 —— 比如外部修改了某个记忆文档
-await fbm.reindexFile('./memories/用户信息.md')
-
-// 清空 —— 比如切换 Embedding 模型前
-await fbm.clearVectors()
-```
-
 ## API 概览
 
 ### FBM 主类
 
+| 方法 | 返回类型 | 说明 |
+|------|----------|------|
+| `init()` | `Promise<void>` | 初始化所有子模块（连接 Qdrant、构建索引） |
+| `retrieve(query)` | `Promise<MemorySummary>` | 检索记忆，支持 `string` 或 `string[]` |
+| `consolidate(messages)` | `Promise<ConsolidationResult>` | 从对话中提取记忆区块并写入 Qdrant |
+| `getStore()` | `QdrantStore` | 获取底层 QdrantStore 实例 |
+| `getDirectoryManager()` | `DirectoryManager` | 获取目录管理器实例 |
+| `getLifecycle()` | `BlockLifecycleManager` | 获取生命周期管理器实例 |
+| `getStats()` | `Promise<{ blockPoints, directoryEntries, uniqueBlocks }>` | 获取存储统计 |
+| `reindexVectors()` | `Promise<number>` | 获取当前区块点数量 |
+| `clearVectors()` | `Promise<void>` | 清空所有向量数据 |
+| `setBaseDir(baseDir)` | `Promise<void>` | 更换基础目录并重新初始化 |
+| `shutdown()` | `Promise<void>` | 关闭 FBM |
+
+### QdrantStore
+
 | 方法 | 说明 |
 |------|------|
-| `init()` | 初始化存储、构建索引、加载向量缓存、启动文件监听 |
-| `retrieve(query)` | 检索记忆，返回 `MemorySummary`（含精炼摘要和原始结果） |
-| `consolidate(messages)` | 从对话中提取记忆并写入文件，返回 `ConsolidationResult` |
-| `writeMemory(title, content, targetFile?)` | 单条写入记忆，可选指定目标文件 |
-| `getStore()` | 获取 MemoryStore 实例 |
-| `getIndexEngine()` | 获取 IndexEngine 实例 |
-| `getVectorIndex()` | 获取 VectorIndex 实例 |
-| `reindexVectors()` | 清空并重建全部向量索引（返回向量条目数） |
-| `reindexFile(filePath)` | 对单个文件重新向量化（返回向量条目数） |
-| `clearVectors()` | 清空全部向量数据 |
-| `shutdown()` | 释放资源（关闭监听器） |
+| `init()` | 初始化集合和索引（Dense + BM25） |
+| `embed(texts)` | 批量文本嵌入 |
+| `writeRawContext(...)` | 写入原始上下文点 |
+| `writeKeywordAnchors(...)` | 写入关键词锚点 |
+| `writeDirectoryEntry(...)` | 写入目录条目 |
+| `assembleBlockData(blockId)` | 组装完整区块数据 |
+| `searchHybrid(queryText, candidateBlockIds, topK?, minScore?)` | 混合检索（Dense + BM25 + RRF） |
+| `searchDenseOnly(queryText, candidateBlockIds, topK?, minScore?)` | 纯 Dense 检索 |
+| `scrollDirectory(filter?)` | 滚动查询目录条目 |
+| `getDirectoryTree()` | 获取完整目录树 |
+| `deleteBlock(blockId)` | 删除区块所有数据 |
+| `updateBlockAccess(blockId)` | 更新区块访问时间和计数 |
+| `getStats()` | 获取存储统计 |
+| `clearAll()` | 清空所有集合 |
 
-### 各模块也可独立使用
+### DirectoryManager
 
-```typescript
-import { MemoryStore, IndexEngine, NodeLocator, parseMarkdown } from '@fairy/bionic-memory'
+| 方法 | 说明 |
+|------|------|
+| `getFullTree()` | 获取完整目录树 |
+| `getCategories()` | 获取所有大类名称 |
+| `getSubCategories(category)` | 获取指定大类下的子类 |
+| `getEntries(category?, subCategory?)` | 按条件查询目录条目 |
+| `getAllEntries()` | 获取所有目录条目 |
+| `getDirectoryTextForLLM()` | 智能选择展示格式（条目少用扁平，多用树形） |
 
-const store = new MemoryStore('./memories')
-await store.init()
+### BlockLifecycleManager
 
-// 创建新文件
-await store.createFile('用户信息', '基本信息', '姓名：cucu')
+| 方法 | 说明 |
+|------|------|
+| `onConsolidationComplete()` | 整合完成回调，周期性触发合并检查 |
+| `onBlockAccessed(blockId)` | 更新访问统计，检查自动升级（≥10 次提升重要度） |
+| `scanExpirationCandidates()` | 扫描过期候选区块 |
+| `reviewExpiration(candidates)` | LLM 审查过期候选 |
+| `executeExpiration(decisions)` | 执行过期决策 |
+| `runExpirationCycle()` | 完整过期检查周期 |
+| `detectMergeCandidates()` | 检测合并候选（同子类内相似度 > 0.85） |
+| `checkAndMerge()` | 完整合并检查流程 |
 
-// 追加章节到已有文件
-await store.appendToFile('用户信息', '技术背景', '前端工程师，主用 TypeScript')
+### MemoryConsolidator
 
-// 获取所有记忆文件及其章节标题
-const files = await store.getMemoryFiles()
-// [{ fileName: '用户信息.md', headings: ['基本信息', '技术背景'] }, ...]
+| 方法 | 说明 |
+|------|------|
+| `consolidate(messages)` | 整合对话为记忆区块（话题分割 → LLM 决策 → 写入） |
 
-// 标题级定位
-const locator = new NodeLocator()
-const headings = parseMarkdown(content, filePath)
-const node = locator.locateByHeadingPath(headings, ['基本信息'])
-const text = locator.extractContent(node)
-```
+### MemoryRetriever
+
+| 方法 | 说明 |
+|------|------|
+| `retrieve(query, context?)` | 三阶段检索（目录筛选 → 混合检索 → 精炼） |
 
 ## 检索流程
 
 ```
-memory_search(query) 被调用
+retrieve(query) 被调用
   │
-  ├─→ KeywordExtractor.extract(query) ─→ 关键词
+  ├─→ 目录阶段: DirectoryManager.getDirectoryTextForLLM()
   │       │
-  │       ▼
-  │   KeywordExtractor.expand(keywords) ─→ 同义词扩展
+  │       └─→ LLM 从目录中选择 1-5 个候选 blockId
+  │
+  ├─→ 混合检索阶段: QdrantStore.searchHybrid()
   │       │
-  │       ▼
-  │   IndexEngine.search() ─→ 关键词匹配 NodeRef[]
+  │       ├─→ Dense 向量检索（语义相似度）
+  │       ├─→ BM25 稀疏向量检索（关键词匹配）
+  │       └─→ RRF 融合排序（失败时回退纯 Dense）
   │
-  ├─→ VectorIndex.searchByText(query) ─→ 语义匹配 SimilarityResult[]  (可选)
+  ├─→ 组装阶段: assembleBlockData()
+  │       │
+  │       └─→ 将 raw_context + keyword_anchor 聚合为完整区块内容
   │
-  ├─→ 合并去重（按 filePath + headingPath）
+  └─→ 精炼阶段 (refineResults=true):
+          │
+          └─→ LLM 筛选 + 结构化总结
+       精炼阶段 (refineResults=false):
+          │
+          └─→ 直接返回原始区块内容
+```
+
+## 记忆整合流程
+
+```
+consolidate(messages) 被调用
   │
-  ├─→ NodeLocator ─→ 定位原始文档章节内容
+  ├─→ 话题分割: LLM 将消息按话题分组为 TopicSegment[]
   │
-  └─→ refineResults=true → 副模型精炼筛选（附带用户原始 query）
-      refineResults=false → 直接返回原始章节内容
+  └─→ 逐段整合:
+          │
+          ├─→ 获取当前目录结构
+          ├─→ LLM 决定操作（create/update/ignore）
+          │     ├── action: 'create' | 'update' | 'ignore'
+          │     ├── category + subCategory（分类）
+          │     ├── keywords（关键词句）
+          │     ├── summary（摘要）
+          │     └── importance（重要度）
+          │
+          ├─→ create: 写入 raw_context + keyword_anchors + directory entry
+          ├─→ update: 按 strategy（incremental/replace）更新区块
+          └─→ ignore: 跳过
 ```
 
 ## 配置参考
@@ -269,12 +304,51 @@ memory_search(query) 被调用
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `memoryDir` | `string` | 是 | 记忆文件存储根目录 |
-| `store` | `StoreConfig` | 否 | 存储配置 |
-| `embedding` | `EmbeddingConfig` | 否 | 嵌入模型配置，不传则禁用向量检索 |
+| `qdrant` | `QdrantConfig` | 否 | Qdrant 配置 |
+| `embedding` | `EmbeddingConfig` | 否 | 嵌入模型配置 |
 | `retrieval` | `RetrievalConfig` | 否 | 检索配置 |
-| `consolidator` | `ConsolidatorConfig` | 否 | 记忆总结配置 |
+| `lifecycle` | `LifecycleConfig` | 否 | 生命周期配置 |
 
-> 副模型（LLM）和嵌入模型（Embedding）通过构造函数注入适配器实例，不写在 config 里。
+### QdrantConfig
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `port` | `number` | `6333` | Qdrant 服务端口 |
+| `memoryBlocksCollection` | `string` | `'memory_blocks'` | 区块向量集合名 |
+| `memoryDirectoryCollection` | `string` | `'memory_directory'` | 目录向量集合名 |
+
+### EmbeddingConfig
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `batchSize` | `number` | `20` | 批量嵌入的每批数量 |
+
+### RetrievalConfig
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `refineResults` | `boolean` | `true` | 是否用 LLM 精炼检索结果 |
+| `retrievalTopK` | `number` | `10` | 检索返回的最大条目数 |
+| `minScore` | `number` | `0.3` | 最低相似度阈值 |
+| `maxContextTokens` | `number` | - | 最大上下文 token 数 |
+| `directoryThreshold` | `number` | `50` | 目录展示格式切换阈值 |
+
+### LifecycleConfig
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enableExpiration` | `boolean` | - | 是否启用过期检查 |
+| `mergeCheckInterval` | `number` | `10` | 每多少次整合后触发一次合并检查 |
+| `expirationThresholds` | `ExpirationThresholds` | - | 各重要度级别的过期天数 |
+
+### ExpirationThresholds
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `critical` | `number` | `Infinity` | critical 级别过期天数 |
+| `high` | `number` | `730` | high 级别过期天数 |
+| `normal` | `number` | `180` | normal 级别过期天数 |
+| `low` | `number` | `60` | low 级别过期天数 |
 
 ### 适配器构造参数
 
@@ -297,33 +371,27 @@ memory_search(query) 被调用
 | `model` | `string` | - | 嵌入模型名称 |
 | `dimension` | `number` | 自动检测 | 向量维度 |
 
-### RetrievalConfig
+## 导出类型
 
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `refineResults` | `boolean` | `true` | 是否用副模型精炼检索结果（false 则返回原始片段） |
-| `retrievalTopK` | `number` | `10` | 每路检索返回的最大条目数 |
-| `minScore` | `number` | `0.5` | 向量检索最低相似度阈值 |
+```typescript
+// 配置
+export type { FBMConfig, QdrantConfig, EmbeddingConfig, RetrievalConfig, LifecycleConfig, ExpirationThresholds }
 
-### EmbeddingConfig
+// 适配器
+export type { LLMAdapter, LLMResponse, EmbeddingAdapter, EmbeddingResponse }
 
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `batchSize` | `number` | `20` | 批量嵌入的每批数量 |
-| `vectorCacheFile` | `string` | - | 向量缓存文件路径 |
+// 对话
+export type { ConversationMessage }
 
-### StoreConfig
+// 区块
+export type { ImportanceLevel, BlockPointType, BlockAction, UpdateStrategy, BlockPayload, NewBlockData, BlockOperation, TopicSegment, SegmentationResult, BlockData, ConsolidationResult }
 
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `indexCacheFile` | `string` | - | 关键词索引缓存文件路径 |
-| `watchFiles` | `boolean` | `true` | 是否监听文件变更自动更新索引 |
+// 目录
+export type { DirectoryEntry, DirectoryCategory, DirectorySubCategory, DirectoryTree, ExpirationCandidate, ExpirationDecision, MergeCandidate, MergeDecision }
 
-### ConsolidatorConfig
-
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `maxSummaryTokens` | `number` | - | 总结最大 token 数 |
+// 检索
+export type { MemorySummary, BlockRetrievalResult }
+```
 
 ## 开发
 
