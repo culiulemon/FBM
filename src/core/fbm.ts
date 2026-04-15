@@ -8,6 +8,7 @@ import { DirectoryManager } from './directory-manager.js'
 import { BlockLifecycleManager } from './block-lifecycle.js'
 import { MemoryConsolidator } from './memory-consolidator.js'
 import { MemoryRetriever } from './memory-retriever.js'
+import { MemoryReorganizer } from './memory-reorganizer.js'
 
 export class FBM {
   private config: FBMConfig
@@ -16,6 +17,7 @@ export class FBM {
   private lifecycle!: BlockLifecycleManager
   private consolidator!: MemoryConsolidator
   private retriever!: MemoryRetriever
+  private _reorganizer!: MemoryReorganizer
   private llm: LLMAdapter
   private embedding: EmbeddingAdapter | null
   private _initialized = false
@@ -38,6 +40,8 @@ export class FBM {
       this.embedding ?? undefined,
       this.config.qdrant?.memoryBlocksCollection,
       this.config.qdrant?.memoryDirectoryCollection,
+      this.config.embedding?.batchSize,
+      this.config.qdrant?.bm25Language,
     )
 
     await this.store.init()
@@ -52,6 +56,8 @@ export class FBM {
       this.store,
       this.directoryManager,
       this.config.lifecycle?.mergeCheckInterval,
+      undefined,
+      this.config.lifecycle?.enableExpiration,
     )
 
     this.consolidator = new MemoryConsolidator(
@@ -72,13 +78,20 @@ export class FBM {
       },
     )
 
+    this._reorganizer = new MemoryReorganizer(
+      this.llm,
+      this.store,
+      this.directoryManager,
+      this.lifecycle,
+    )
+
     this._initialized = true
   }
 
-  async retrieve(query: string | string[]): Promise<MemorySummary> {
+  async retrieve(query: string | string[], context?: string): Promise<MemorySummary> {
     this.ensureInitialized()
     const queryStr = Array.isArray(query) ? query.join(' ') : query
-    return this.retriever.retrieve(queryStr)
+    return this.retriever.retrieve(queryStr, context)
   }
 
   async consolidate(messages: ConversationMessage[]): Promise<ConsolidationResult> {
@@ -101,6 +114,11 @@ export class FBM {
   getLifecycle(): BlockLifecycleManager {
     this.ensureInitialized()
     return this.lifecycle
+  }
+
+  getReorganizer(): MemoryReorganizer {
+    this.ensureInitialized()
+    return this._reorganizer
   }
 
   async getStats(): Promise<{ blockPoints: number; directoryEntries: number; uniqueBlocks: number }> {

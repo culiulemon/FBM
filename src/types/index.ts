@@ -25,3 +25,14 @@ export type {
   MergeDecision,
 } from './directory.js'
 export type { MemorySummary, BlockRetrievalResult } from './retrieval.js'
+export type {
+  ReorganizationCheckpoint,
+  ReorganizeOperation,
+  ReorganizationResult,
+  ReorganizationProgress,
+  SplitAssignment,
+  AnalysisResult,
+  AnalysisOperation,
+  NeedsReclassifyItem,
+  ReclassifyDecision,
+} from './reorganization.js'

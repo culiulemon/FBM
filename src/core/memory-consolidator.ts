@@ -3,6 +3,7 @@ import type { LLMAdapter, LLMMessage } from '../types/adapter.js'
 import type { SegmentationResult, BlockOperation, ConsolidationResult } from '../types/block.js'
 import type { QdrantStore } from './qdrant-store.js'
 import type { DirectoryManager } from './directory-manager.js'
+import { extractJsonObject, extractJsonArray } from './json-utils.js'
 
 function generateBlockId(): string {
   const ts = Date.now().toString(36)
@@ -156,6 +157,21 @@ export class MemoryConsolidator {
 
     console.log(`[Consolidator] Starting consolidation with ${messages.length} messages`)
 
+    const directoryTree = await this.directoryManager.buildDirectoryTreeText()
+
+    let relatedBlocks = ''
+    try {
+      const allEntries = await this.directoryManager.getEntries()
+      if (allEntries.length > 0) {
+        relatedBlocks = allEntries
+          .slice(0, 20)
+          .map(e => `- [${e.blockId}] ${e.directoryEntry} (${e.importance}): ${e.summary}`)
+          .join('\n')
+      }
+    } catch {
+      // best effort
+    }
+
     const segmentation = await this.segmentTopics(messages)
     console.log(`[Consolidator] Segmented into ${segmentation.segments.length} segments`)
 
@@ -170,7 +186,7 @@ export class MemoryConsolidator {
 
       if (segmentMessages.length === 0) continue
 
-      const operations = await this.integrateSegment(segmentMessages)
+      const operations = await this.integrateSegment(segmentMessages, directoryTree, relatedBlocks)
       console.log(`[Consolidator] Segment "${segment.topicHint}": ${operations.length} operations:`, operations.map(o => o.action))
 
       for (const op of operations) {
@@ -220,14 +236,13 @@ export class MemoryConsolidator {
   }
 
   private parseSegmentation(content: string): SegmentationResult {
-    const trimmed = content.trim()
-    const jsonMatch = trimmed.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) {
+    const jsonStr = extractJsonObject(content)
+    if (!jsonStr) {
       return { segments: [{ messageIndices: [0], topicHint: 'default' }] }
     }
 
     try {
-      const parsed = JSON.parse(jsonMatch[0])
+      const parsed = JSON.parse(jsonStr)
       if (parsed.segments && Array.isArray(parsed.segments)) {
         return parsed as SegmentationResult
       }
@@ -238,17 +253,14 @@ export class MemoryConsolidator {
     return { segments: [{ messageIndices: [0], topicHint: 'default' }] }
   }
 
-  private async integrateSegment(messages: ConversationMessage[]): Promise<BlockOperation[]> {
-    const directoryTree = await this.directoryManager.buildDirectoryTreeText()
-    const relatedBlocks = ''
-
+  private async integrateSegment(messages: ConversationMessage[], directoryTree: string, relatedBlocks: string): Promise<BlockOperation[]> {
     const conversationText = messages
       .map(m => `[${m.role}]: ${m.content}`)
       .join('\n')
 
     const prompt = CONSOLIDATION_PROMPT
       .replace('{directoryTree}', directoryTree)
-      .replace('{relatedBlocks}', relatedBlocks)
+      .replace('{relatedBlocks}', relatedBlocks || '（无已有区块）')
 
     const llmMessages: LLMMessage[] = [
       { role: 'system', content: prompt },
@@ -261,12 +273,11 @@ export class MemoryConsolidator {
   }
 
   private parseOperations(content: string): BlockOperation[] {
-    const trimmed = content.trim()
-    const jsonMatch = trimmed.match(/\[[\s\S]*\]/)
-    if (!jsonMatch) return [{ action: 'ignore' }]
+    const jsonStr = extractJsonArray(content)
+    if (!jsonStr) return [{ action: 'ignore' }]
 
     try {
-      const parsed = JSON.parse(jsonMatch[0])
+      const parsed = JSON.parse(jsonStr)
       if (Array.isArray(parsed)) {
         return parsed.filter(op =>
           typeof op === 'object' && op !== null && typeof op.action === 'string'
@@ -317,6 +328,9 @@ export class MemoryConsolidator {
 
     if (strategy === 'replace') {
       await this.store.deleteBlock(blockId)
+    } else {
+      await this.store.deleteKeywordAnchors(blockId)
+      await this.store.deleteDirectoryEntry(blockId)
     }
 
     await this.store.writeRawContext(
@@ -331,11 +345,13 @@ export class MemoryConsolidator {
       block.summary, block.importance,
     )
 
+    const existingData = await this.store.assembleBlockData(blockId)
+    const rawContextCount = existingData ? existingData.rawContents.length : 1
     await this.store.writeDirectoryEntry(
       blockId, block.directoryEntry,
       block.category, block.subCategory,
       block.summary, block.keywords, block.importance,
-      1 + block.keywords.length,
+      rawContextCount + block.keywords.length,
     )
   }
 }

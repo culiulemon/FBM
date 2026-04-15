@@ -3,6 +3,7 @@ import type { ImportanceLevel } from '../types/block.js'
 import type { ExpirationCandidate, ExpirationDecision, MergeCandidate, MergeDecision } from '../types/directory.js'
 import type { QdrantStore } from './qdrant-store.js'
 import type { DirectoryManager } from './directory-manager.js'
+import { extractJsonObject, extractJsonArray } from './json-utils.js'
 
 const IMPORTANCE_MULTIPLIERS: Record<string, number> = {
   critical: Infinity,
@@ -92,6 +93,8 @@ export class BlockLifecycleManager {
   private expirationDays: Record<string, number>
   private consolidationCount: number
   private mergeCheckInterval: number
+  private enableExpiration: boolean
+  private expirationCheckInterval: number
 
   constructor(
     llm: LLMAdapter,
@@ -99,12 +102,15 @@ export class BlockLifecycleManager {
     directoryManager: DirectoryManager,
     mergeCheckInterval?: number,
     expirationDays?: Record<string, number>,
+    enableExpiration?: boolean,
   ) {
     this.llm = llm
     this.store = store
     this.directoryManager = directoryManager
     this.mergeCheckInterval = mergeCheckInterval ?? 10
     this.expirationDays = expirationDays ?? DEFAULT_EXPIRATION_DAYS
+    this.enableExpiration = enableExpiration ?? false
+    this.expirationCheckInterval = 20
     this.consolidationCount = 0
   }
 
@@ -115,6 +121,11 @@ export class BlockLifecycleManager {
         console.warn('[FBM] Lifecycle merge check failed:', err)
       })
     }
+    if (this.enableExpiration && this.consolidationCount % this.expirationCheckInterval === 0) {
+      this.runExpirationCycle().catch(err => {
+        console.warn('[FBM] Lifecycle expiration check failed:', err)
+      })
+    }
   }
 
   async onBlockAccessed(blockId: string): Promise<void> {
@@ -123,7 +134,7 @@ export class BlockLifecycleManager {
     const entries = await this.directoryManager.getEntries()
     const entry = entries.find(e => e.blockId === blockId)
     if (entry) {
-      const newImportance = this.checkAutoUpgrade(entry.importance, entry.pointCount + 1)
+      const newImportance = this.checkAutoUpgrade(entry.importance, entry.accessCount + 1)
       if (newImportance !== entry.importance) {
         // importance upgraded
       }
@@ -193,12 +204,11 @@ export class BlockLifecycleManager {
   }
 
   private parseExpirationDecisions(content: string): ExpirationDecision[] {
-    const trimmed = content.trim()
-    const jsonMatch = trimmed.match(/\[[\s\S]*\]/)
-    if (!jsonMatch) return []
+    const jsonStr = extractJsonArray(content)
+    if (!jsonStr) return []
 
     try {
-      const parsed = JSON.parse(jsonMatch[0])
+      const parsed = JSON.parse(jsonStr)
       if (Array.isArray(parsed)) {
         return parsed.filter((d: unknown) =>
           typeof d === 'object' && d !== null && typeof (d as Record<string, unknown>).blockId === 'string'
@@ -250,24 +260,21 @@ export class BlockLifecycleManager {
     for (const [, group] of bySubCategory) {
       if (group.length < 2) continue
 
+      const texts = group.map(e => e.directoryEntry)
+      const vectors = await this.store.embed(texts)
+
       for (let i = 0; i < group.length; i++) {
         for (let j = i + 1; j < group.length; j++) {
-          const entryA = group[i]
-          const entryB = group[j]
-
-          const vectorsA = await this.store.embed([entryA.directoryEntry])
-          const vectorsB = await this.store.embed([entryB.directoryEntry])
-
-          const similarity = this.cosineSimilarity(vectorsA[0], vectorsB[0])
+          const similarity = this.cosineSimilarity(vectors[i], vectors[j])
 
           if (similarity > 0.85) {
             candidates.push({
-              blockIdA: entryA.blockId,
-              blockIdB: entryB.blockId,
-              entryA: entryA.directoryEntry,
-              entryB: entryB.directoryEntry,
-              summaryA: entryA.summary,
-              summaryB: entryB.summary,
+              blockIdA: group[i].blockId,
+              blockIdB: group[j].blockId,
+              entryA: group[i].directoryEntry,
+              entryB: group[j].directoryEntry,
+              summaryA: group[i].summary,
+              summaryB: group[j].summary,
               similarity,
             })
           }
@@ -308,12 +315,11 @@ export class BlockLifecycleManager {
   }
 
   private parseMergeDecision(content: string): MergeDecision {
-    const trimmed = content.trim()
-    const jsonMatch = trimmed.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) return { shouldMerge: false, reason: 'parse failed' }
+    const jsonStr = extractJsonObject(content)
+    if (!jsonStr) return { shouldMerge: false, reason: 'parse failed' }
 
     try {
-      const parsed = JSON.parse(jsonMatch[0])
+      const parsed = JSON.parse(jsonStr)
       return {
         shouldMerge: parsed.shouldMerge ?? false,
         reason: parsed.reason ?? '',
@@ -336,17 +342,25 @@ export class BlockLifecycleManager {
       ? candidate.blockIdB
       : candidate.blockIdA
 
+    const keepData = await this.store.assembleBlockData(keepBlockId)
     const removeData = await this.store.assembleBlockData(removeBlockId)
+
+    const category = keepData?.category ?? removeData?.category ?? ''
+    const subCategory = keepData?.subCategory ?? removeData?.subCategory ?? ''
+    const importance = keepData?.importance ?? 'normal'
+
+    await this.store.deleteKeywordAnchors(keepBlockId)
+    await this.store.deleteDirectoryEntry(keepBlockId)
     await this.store.deleteBlock(removeBlockId)
 
-    if (removeData && decision.mergedSummary) {
+    if (decision.mergedSummary) {
       await this.store.writeRawContext(
         keepBlockId,
         decision.mergedSummary,
         decision.mergedDirectoryEntry ?? candidate.entryA,
-        '', '',
+        category, subCategory,
         decision.mergedSummary,
-        'normal',
+        importance,
       )
     }
 
@@ -355,11 +369,22 @@ export class BlockLifecycleManager {
         keepBlockId,
         decision.mergedKeywords,
         decision.mergedDirectoryEntry ?? candidate.entryA,
-        '', '',
+        category, subCategory,
         decision.mergedSummary ?? '',
-        'normal',
+        importance,
       )
     }
+
+    const mergedKwCount = decision.mergedKeywords?.length ?? 0
+    await this.store.writeDirectoryEntry(
+      keepBlockId,
+      decision.mergedDirectoryEntry ?? candidate.entryA,
+      category, subCategory,
+      decision.mergedSummary ?? '',
+      decision.mergedKeywords ?? [],
+      importance,
+      1 + mergedKwCount,
+    )
 
     return keepBlockId
   }

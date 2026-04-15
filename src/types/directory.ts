@@ -11,6 +11,7 @@ export interface DirectoryEntry {
   createdAt: number
   updatedAt: number
   lastAccessedAt: number
+  accessCount: number
 }
 
 export interface DirectoryCategory {

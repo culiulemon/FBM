@@ -4,11 +4,7 @@ import type { BlockPayload, BlockData, ImportanceLevel } from '../types/block.js
 import type { DirectoryEntry, DirectoryCategory, DirectorySubCategory, DirectoryTree } from '../types/directory.js'
 
 function uuid(): string {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0
-    const v = c === 'x' ? r : (r & 0x3) | 0x8
-    return v.toString(16)
-  })
+  return globalThis.crypto.randomUUID()
 }
 
 const BLOCKS_COLLECTION = 'memory_blocks'
@@ -20,13 +16,17 @@ export class QdrantStore {
   private directoryCollection: string
   private embedding: EmbeddingAdapter | null
   private _dimension: number | null
+  private batchSize: number
+  private bm25Language: string
 
-  constructor(port: number, embedding?: EmbeddingAdapter, blocksCollection?: string, directoryCollection?: string) {
+  constructor(port: number, embedding?: EmbeddingAdapter, blocksCollection?: string, directoryCollection?: string, batchSize?: number, bm25Language?: string) {
     this.client = new QdrantClient({ url: `http://127.0.0.1:${port}`, timeout: 30000 })
     this.blocksCollection = blocksCollection ?? BLOCKS_COLLECTION
     this.directoryCollection = directoryCollection ?? DIRECTORY_COLLECTION
     this.embedding = embedding ?? null
     this._dimension = null
+    this.batchSize = batchSize ?? 20
+    this.bm25Language = bm25Language ?? 'chinese'
   }
 
   async init(): Promise<void> {
@@ -98,10 +98,9 @@ export class QdrantStore {
 
   async embed(texts: string[]): Promise<number[][]> {
     if (!this.embedding) throw new Error('No embedding adapter configured')
-    const batchSize = 20
     const allEmbeddings: number[][] = []
-    for (let i = 0; i < texts.length; i += batchSize) {
-      const batch = texts.slice(i, i + batchSize)
+    for (let i = 0; i < texts.length; i += this.batchSize) {
+      const batch = texts.slice(i, i + this.batchSize)
       const resp = await this.embedding.embed(batch)
       allEmbeddings.push(...resp.embeddings)
     }
@@ -169,7 +168,7 @@ export class QdrantStore {
         bm25: {
           text: kw,
           model: 'qdrant/bm25',
-          options: { language: 'chinese' },
+          options: { language: this.bm25Language },
         } as unknown as number[],
       },
       payload: {
@@ -233,6 +232,8 @@ export class QdrantStore {
   async scrollByBlockId(blockId: string): Promise<BlockPayload[]> {
     const points: BlockPayload[] = []
     let offset: string | number | undefined = undefined
+    let pages = 0
+    const maxPages = 10
 
     do {
       const result = await this.client.scroll(this.blocksCollection, {
@@ -253,7 +254,8 @@ export class QdrantStore {
       }
 
       offset = result.next_page_offset as string | number | undefined
-    } while (offset)
+      pages++
+    } while (offset && pages < maxPages)
 
     return points
   }
@@ -305,49 +307,29 @@ export class QdrantStore {
         }
 
     try {
-      const [hybridResults, denseResults] = await Promise.all([
-        this.client.query(this.blocksCollection, {
-          prefetch: [
-            {
-              query: queryVector,
-              using: 'dense',
-              filter,
-              limit: topK,
-            },
-            {
-              query: {
-                text: queryText,
-                model: 'qdrant/bm25',
-                options: { language: 'chinese' },
-              } as unknown as number[],
-              using: 'bm25',
-              filter,
-              limit: topK,
-            },
-          ],
-          query: { fusion: 'rrf' },
-          limit: topK,
-          with_payload: true,
-        }),
-        this.client.search(this.blocksCollection, {
-          vector: { name: 'dense', vector: queryVector },
-          filter,
-          limit: topK,
-          with_payload: true,
-        }),
-      ])
-
-      console.log('[HybridCompare] query:', queryText.slice(0, 60))
-      console.log('[HybridCompare] hybrid (dense+bm25+rrf):', hybridResults.points.length, 'results')
-      for (const p of hybridResults.points) {
-        const pl = p.payload as unknown as BlockPayload
-        console.log('[HybridCompare]   hybrid - score:', p.score?.toFixed(4), 'kw:', (pl.keywordSentence ?? '').slice(0, 40))
-      }
-      console.log('[HybridCompare] dense-only:', denseResults.length, 'results')
-      for (const p of denseResults) {
-        const pl = p.payload as unknown as BlockPayload
-        console.log('[HybridCompare]   dense  - score:', p.score?.toFixed(4), 'kw:', (pl.keywordSentence ?? '').slice(0, 40))
-      }
+      const hybridResults = await this.client.query(this.blocksCollection, {
+        prefetch: [
+          {
+            query: queryVector,
+            using: 'dense',
+            filter,
+            limit: topK,
+          },
+          {
+            query: {
+              text: queryText,
+              model: 'qdrant/bm25',
+              options: { language: this.bm25Language },
+            } as unknown as number[],
+            using: 'bm25',
+            filter,
+            limit: topK,
+          },
+        ],
+        query: { fusion: 'rrf' },
+        limit: topK,
+        with_payload: true,
+      })
 
       const scored: Array<{ pointId: string; blockId: string; keywordSentence: string; score: number; source: 'dense' | 'sparse' | 'hybrid' }> = []
 
@@ -416,6 +398,8 @@ export class QdrantStore {
   async scrollDirectory(filter?: Record<string, unknown>): Promise<DirectoryEntry[]> {
     const entries: DirectoryEntry[] = []
     let offset: string | number | undefined = undefined
+    let pages = 0
+    const maxPages = 50
 
     const mustFilters: Array<{ key: string; match: { value: string } }> = [
       { key: 'status', match: { value: 'active' } },
@@ -453,11 +437,13 @@ export class QdrantStore {
           createdAt: p.createdAt as number,
           updatedAt: p.updatedAt as number,
           lastAccessedAt: p.lastAccessedAt as number,
+          accessCount: (p.accessCount as number) ?? 0,
         })
       }
 
       offset = result.next_page_offset as string | number | undefined
-    } while (offset)
+      pages++
+    } while (offset && pages < maxPages)
 
     return entries
   }
@@ -507,6 +493,17 @@ export class QdrantStore {
     }
   }
 
+  async deleteKeywordAnchors(blockId: string): Promise<void> {
+    await this.client.delete(this.blocksCollection, {
+      filter: {
+        must: [
+          { key: 'blockId', match: { value: blockId } },
+          { key: 'type', match: { value: 'keyword_anchor' } },
+        ],
+      },
+    })
+  }
+
   async deleteDirectoryEntry(blockId: string): Promise<void> {
     await this.client.delete(this.directoryCollection, {
       filter: {
@@ -515,31 +512,43 @@ export class QdrantStore {
     })
   }
 
+  async updateBlockPayloadFields(blockId: string, fields: Record<string, unknown>): Promise<void> {
+    await this.client.setPayload(this.blocksCollection, {
+      payload: fields,
+      filter: { must: [{ key: 'blockId', match: { value: blockId } }] },
+    })
+  }
+
   async updateBlockAccess(blockId: string): Promise<void> {
     const now = Date.now()
 
-    const points = await this.scrollByBlockId(blockId)
-    for (const _point of points) {
-      // no-op: we update via directory entry for efficiency
-    }
-
     try {
       const dirEntries = await this.scrollDirectory({ blockId })
-      for (const _entry of dirEntries) {
-        // update via point ID
-      }
+      if (dirEntries.length === 0) return
+
+      const currentAccessCount = dirEntries[0].accessCount ?? 0
+      await this.client.setPayload(this.directoryCollection, {
+        payload: {
+          lastAccessedAt: now,
+          accessCount: currentAccessCount + 1,
+          updatedAt: now,
+        } as unknown as Record<string, unknown>,
+        filter: { must: [{ key: 'blockId', match: { value: blockId } }] },
+      })
     } catch {
       // best effort
     }
 
-    // Use batch update via payload
     try {
-      await this.client.setPayload(this.directoryCollection, {
-        payload: { lastAccessedAt: now, accessCount: { increment: 1 } } as unknown as Record<string, unknown>,
+      await this.client.setPayload(this.blocksCollection, {
+        payload: {
+          lastAccessedAt: now,
+          updatedAt: now,
+        } as unknown as Record<string, unknown>,
         filter: { must: [{ key: 'blockId', match: { value: blockId } }] },
       })
     } catch {
-      // fallback: no-op
+      // best effort
     }
   }
 
@@ -608,6 +617,7 @@ export class QdrantStore {
         createdAt: p.createdAt as number,
         updatedAt: p.updatedAt as number,
         lastAccessedAt: p.lastAccessedAt as number,
+        accessCount: (p.accessCount as number) ?? 0,
       }
     })
   }

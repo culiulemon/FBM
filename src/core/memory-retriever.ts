@@ -3,6 +3,7 @@ import type { MemorySummary, BlockRetrievalResult } from '../types/retrieval.js'
 import type { QdrantStore } from './qdrant-store.js'
 import type { DirectoryManager } from './directory-manager.js'
 import type { BlockLifecycleManager } from './block-lifecycle.js'
+import { extractJsonObject } from './json-utils.js'
 
 const DIRECTORY_BROWSE_PROMPT = `你是一个记忆检索助手。以下是当前的记忆目录结构，请根据用户的查询，选择最相关的记忆分区。
 
@@ -139,23 +140,33 @@ export class MemoryRetriever {
 
       const response = await this.llm.chat(messages, { temperature: 0.3 })
       const parsed = this.parseBlockIds(response.content)
-      return parsed
+      if (parsed.length > 0) return parsed
+    } catch {
+      // fall through to dense fallback
+    }
+
+    try {
+      const denseEntries = await this.store.searchDirectoryDense(query, 5)
+      return denseEntries.map(e => e.blockId)
     } catch {
       return []
     }
   }
 
   private parseBlockIds(content: string): string[] {
-    const trimmed = content.trim()
-    const jsonMatch = trimmed.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) return []
+    const jsonStr = extractJsonObject(content)
+    if (!jsonStr) return []
 
     try {
-      const parsed = JSON.parse(jsonMatch[0])
+      const parsed = JSON.parse(jsonStr)
       if (Array.isArray(parsed.selectedBlockIds)) {
         return parsed.selectedBlockIds
-          .map((id: unknown) => typeof id === 'string' ? id.replace(/^block:/, '') : id)
-          .filter((id: unknown) => typeof id === 'string')
+          .map((id: unknown) => {
+            if (typeof id !== 'string') return null
+            const match = id.match(/blk_[a-z0-9_]+/)
+            return match ? match[0] : null
+          })
+          .filter((id: string | null): id is string => id !== null)
       }
     } catch {
       // fall through

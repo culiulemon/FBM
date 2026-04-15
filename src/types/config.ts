@@ -10,6 +10,7 @@ export interface QdrantConfig {
   port?: number
   memoryBlocksCollection?: string
   memoryDirectoryCollection?: string
+  bm25Language?: string
 }
 
 export interface EmbeddingConfig {
